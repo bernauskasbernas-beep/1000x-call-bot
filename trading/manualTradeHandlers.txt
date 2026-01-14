@@ -1,0 +1,40 @@
+
+// ==================== MANUAL TRADING HANDLERS ====================
+
+// Manual Trade Menu
+bot.action('trading_manual', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id;
+    const users = loadTradingUsers();
+    const user = users[userId];
+    
+    await ctx.editMessageText(`🛒 <b>MANUAL TRADE</b>
+
+💰 Balance: ${user.balance.toFixed(3)} SOL`, {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🟢 BUY Token', callback_data: 'trading_manual_buy' }],
+                [{ text: '🔴 SELL Position', callback_data: 'trading_manual_sell' }],
+                [{ text: '⬅️ Back', callback_data: 'menu_trading' }]
+            ]
+        }
+    });
+});
+
+// Manual BUY
+bot.action('trading_manual_buy', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText('🟢 <b>MANUAL BUY</b>\n\nSend token mint address:', {
+        parse_mode: 'HTML',
+        reply_markup: {
+            inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'trading_manual' }]]
+        }
+    });
+    
+    const userId = ctx.from.id;
+    const users = loadTradingUsers();
+    if (!users[userId]) users[userId] = { balance: 0, positions: [] };
+    users[userId].waitingForBuyAddress = true;
+    saveTradingUsers(users);
+});

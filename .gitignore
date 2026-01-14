@@ -1,0 +1,25 @@
+# Environment variables (IMPORTANT - contains secrets!)
+.env
+
+# Dependencies
+node_modules/
+
+# User data (contains private keys and user info)
+data/user_wallets.json
+data/trading_users.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Temporary files
+*.tmp
+*.temp

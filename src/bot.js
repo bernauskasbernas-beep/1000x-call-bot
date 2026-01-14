@@ -1,0 +1,1367 @@
+require('dotenv').config();
+const { Telegraf } = require('telegraf');
+const axios = require('axios');
+const PumpFunTracker = require('./services/pumpfunTracker');
+const { formatCallMessage } = require('./utils/formatter');
+const autoTrader = require('../trading/autoTrader');
+
+// Initialize bot
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const tracker = new PumpFunTracker();
+
+// Channels to post calls
+const CHANNEL_ID = process.env.CHANNEL_ID || '@your_channel';  // PAID - instant
+const FREE_CHANNEL_ID = process.env.FREE_CHANNEL_ID || null;   // FREE - delayed
+const FREE_DELAY_MS = parseInt(process.env.FREE_DELAY_MS) || 120000; // 2 min delay
+
+// ==================== SUBSCRIPTION SYSTEM ====================
+const ADMIN_IDS = [1967466851]; // Admin Telegram IDs
+
+const SUBSCRIPTION_CONFIG = {
+    walletAddress: 'Gzos8rvjcPD6WWk1YQKFRSbPx9GioPcejLGuZtpHSNDG',
+    priceSOL: 0.26,
+    paidGroupChatId: -1003321804950, // PAID channel ID (@callbot1000x)
+};
+
+// Generate unique one-time invite link for subscriber
+async function generateUniqueInviteLink(userId) {
+    try {
+        const inviteLink = await bot.telegram.createChatInviteLink(SUBSCRIPTION_CONFIG.paidGroupChatId, {
+            member_limit: 1,  // Only 1 person can use this link
+            expire_date: Math.floor(Date.now() / 1000) + 86400,  // Expires in 24 hours
+            name: `User_${userId}_${Date.now()}`  // Optional name for tracking
+        });
+        return inviteLink.invite_link;
+    } catch (error) {
+        console.error('Failed to create invite link:', error.message);
+        return null;
+    }
+}
+
+// Track pending payments: oderId -> { telegramId, oderId, createdAt }
+const pendingPayments = new Map();
+// Track verified users to prevent double-claiming
+const verifiedPayments = new Set(); // transaction signatures
+
+// Generate unique order ID for memo field
+function generateOrderId() {
+    return Math.random().toString(36).substring(2, 8).toUpperCase();
+}
+
+// Check Solana transactions for payment
+async function checkPayment(orderId, minAmount) {
+    try {
+        // Use Helius API (free tier) to check transactions
+        const response = await axios.get(
+            `https://api.helius.xyz/v0/addresses/${SUBSCRIPTION_CONFIG.walletAddress}/transactions?api-key=5c70b747-7e24-415b-8b87-697caaad0360&type=TRANSFER`,
+            { timeout: 15000 }
+        );
+
+        const transactions = response.data || [];
+        const now = Date.now();
+        const oneHourAgo = now - (60 * 60 * 1000); // Check last hour
+
+        for (const tx of transactions) {
+            // Skip if already verified
+            if (verifiedPayments.has(tx.signature)) continue;
+
+            // Check if transaction is recent enough
+            const txTime = tx.timestamp * 1000;
+            if (txTime < oneHourAgo) continue;
+
+            // Check if it's a SOL transfer to our wallet
+            if (tx.nativeTransfers) {
+                for (const transfer of tx.nativeTransfers) {
+                    if (transfer.toUserAccount === SUBSCRIPTION_CONFIG.walletAddress) {
+                        const amountSOL = transfer.amount / 1e9; // lamports to SOL
+
+                        // Check if amount matches (with small tolerance)
+                        if (amountSOL >= minAmount * 0.99) {
+                            // Check memo for order ID
+                            const memo = tx.memo || '';
+                            if (memo.includes(orderId) || amountSOL >= minAmount) {
+                                return { success: true, signature: tx.signature, amount: amountSOL };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback: Use Solscan API
+        const solscanResponse = await axios.get(
+            `https://api.solscan.io/account/transfer?account=${SUBSCRIPTION_CONFIG.walletAddress}&limit=20`,
+            { timeout: 15000, headers: { 'Accept': 'application/json' } }
+        );
+
+        const solscanTxs = solscanResponse.data?.data || [];
+        for (const tx of solscanTxs) {
+            if (verifiedPayments.has(tx.txHash)) continue;
+
+            const txTime = tx.blockTime * 1000;
+            if (txTime < oneHourAgo) continue;
+
+            if (tx.dst === SUBSCRIPTION_CONFIG.walletAddress && tx.lamport) {
+                const amountSOL = tx.lamport / 1e9;
+                if (amountSOL >= minAmount * 0.99) {
+                    return { success: true, signature: tx.txHash, amount: amountSOL };
+                }
+            }
+        }
+
+        return { success: false };
+    } catch (error) {
+        console.error('Payment check error:', error.message);
+        // If API fails, return pending status
+        return { success: false, error: error.message };
+    }
+}
+
+// Filters
+const FILTERS = {
+    minLiquidity: parseInt(process.env.MIN_LIQUIDITY) || 0,
+    minMarketCap: parseInt(process.env.MIN_MARKET_CAP) || 0,
+    maxAgeMinutes: parseInt(process.env.MAX_AGE_MINUTES) || 120,
+    minBuyRatio: parseFloat(process.env.MIN_BUY_RATIO) || 0
+};
+
+// Stats
+let stats = {
+    callsSent: 0,
+    tokensScanned: 0,
+    tokensFiltered: 0,
+    startedAt: Date.now()
+};
+
+// Performance tracking - stores final X achieved by each token
+const performanceHistory = new Map(); // address -> { symbol, name, maxX, calledAt, initialMC }
+
+// Duplicate call prevention - track recently called tokens
+const recentlyCalled = new Set(); // token addresses called in last 5 minutes
+
+// ==================== PRICE TRACKER ====================
+
+// Store called tokens with their initial price/MC
+const trackedTokens = new Map();
+
+// Milestones to alert (2x, 3x, 5x, 10x, etc.)
+const MILESTONES = [2, 3, 5, 10, 20, 50, 100];
+
+// Track a new token
+function trackToken(token, messageId, freeMessageId = null) {
+    const now = Date.now();
+    trackedTokens.set(token.address, {
+        name: token.name,
+        symbol: token.symbol,
+        initialPrice: token.price,
+        initialMC: token.marketCap,
+        image: token.image,
+        calledAt: now,
+        lastMilestone: 1,
+        maxX: 1,
+        alertedMilestones: new Set([1]),
+        messageId: messageId, // Store PAID channel message ID for reply
+        freeMessageId: freeMessageId // Store FREE channel message ID for reply
+    });
+
+    // Also add to performance history
+    performanceHistory.set(token.address, {
+        symbol: token.symbol,
+        name: token.name,
+        maxX: 1,
+        calledAt: now,
+        initialMC: token.marketCap
+    });
+
+    console.log(`📌 Tracking: ${token.symbol} @ $${token.marketCap.toLocaleString()} MC | Image: ${token.image ? '✅' : '❌'}`);
+}
+
+// Check token prices and send milestone alerts
+async function checkMilestones() {
+    if (trackedTokens.size === 0) return;
+
+    console.log(`🔄 Checking ${trackedTokens.size} tracked tokens...`);
+
+    for (const [address, data] of trackedTokens) {
+        try {
+            // Get current price
+            const response = await axios.get(
+                `https://api.dexscreener.com/latest/dex/tokens/${address}`,
+                { timeout: 10000 }
+            );
+
+            const pairs = response.data.pairs;
+            if (!pairs || pairs.length === 0) continue;
+
+            const currentMC = pairs[0].fdv || 0;
+            const currentPrice = parseFloat(pairs[0].priceUsd) || 0;
+
+            if (data.initialMC === 0) continue;
+
+            // Calculate multiplier
+            const multiplier = currentMC / data.initialMC;
+
+            // DEBUG: Show current status
+            console.log(`   📊 ${data.symbol}: ${multiplier.toFixed(2)}x (MC: $${currentMC.toLocaleString()} / Initial: $${data.initialMC.toLocaleString()})`);
+
+            // Update maxX for stats tracking
+            if (multiplier > data.maxX) {
+                data.maxX = multiplier;
+                // Also update performance history
+                if (performanceHistory.has(address)) {
+                    performanceHistory.get(address).maxX = multiplier;
+                }
+            }
+
+            // Check for new milestones
+            for (const milestone of MILESTONES) {
+                if (multiplier >= milestone && !data.alertedMilestones.has(milestone)) {
+                    // New milestone reached! Mark as alerted BEFORE sending
+                    data.alertedMilestones.add(milestone);
+                    data.lastMilestone = milestone;
+
+                    console.log(`🎯 ${data.symbol} reached ${milestone}x!`);
+
+                    // Send alert
+                    await sendMilestoneAlert(data, currentMC, currentPrice, multiplier, milestone);
+                }
+            }
+
+            // Remove tokens older than 24 hours (but keep in performanceHistory for stats)
+            if (Date.now() - data.calledAt > 24 * 60 * 60 * 1000) {
+                trackedTokens.delete(address);
+                console.log(`🗑️ Removed old token: ${data.symbol}`);
+            }
+
+        } catch (error) {
+            // Ignore errors for individual tokens
+        }
+    }
+}
+
+// Send milestone alert as reply to original call
+async function sendMilestoneAlert(data, currentMC, currentPrice, multiplier, milestone) {
+    const rocketEmoji = milestone >= 10 ? '🚀🚀🚀' : milestone >= 5 ? '🚀🚀' : '🚀';
+
+    // Show exact multiplier with 2 decimal places (e.g. 2.17x, 5.43x)
+    const exactX = multiplier.toFixed(2);
+    const message = `*${data.symbol}* gains ${rocketEmoji} ${exactX}x ${rocketEmoji}
+💰 Call MC: $${formatNumber(data.initialMC)}
+💎 Current MC: $${formatNumber(currentMC)}`;
+
+    // Send to PAID channel (instant)
+    try {
+        const options = {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true
+        };
+
+        // Reply to original call message if we have messageId
+        if (data.messageId) {
+            console.log(`   📎 Replying to message ID: ${data.messageId}`);
+            options.reply_parameters = {
+                message_id: data.messageId,
+                allow_sending_without_reply: true
+            };
+        } else {
+            console.log(`   ⚠️ No messageId stored for ${data.symbol}`);
+        }
+
+        await bot.telegram.sendMessage(CHANNEL_ID, message, options);
+        console.log(`📢 Milestone alert sent: ${data.symbol} ${milestone}x ${data.messageId ? '(reply)' : ''}`);
+    } catch (error) {
+        console.error('Error sending milestone:', error.message);
+    }
+
+    // Send to FREE channel (delayed)
+    if (FREE_CHANNEL_ID) {
+        setTimeout(async () => {
+            try {
+                const freeOptions = {
+                    parse_mode: 'Markdown',
+                    disable_web_page_preview: true
+                };
+
+                // Reply to original FREE call message if we have freeMessageId
+                if (data.freeMessageId) {
+                    console.log(`   📎 FREE Replying to message ID: ${data.freeMessageId}`);
+                    freeOptions.reply_parameters = {
+                        message_id: data.freeMessageId,
+                        allow_sending_without_reply: true
+                    };
+                }
+
+                await bot.telegram.sendMessage(FREE_CHANNEL_ID, message, freeOptions);
+                console.log(`📢 FREE milestone sent: ${data.symbol} ${milestone}x (delayed)`);
+            } catch (error) {
+                console.error('Error sending FREE milestone:', error.message);
+            }
+        }, FREE_DELAY_MS);
+    }
+}
+
+// Helper functions
+function formatNumber(num) {
+    if (!num) return '0';
+    if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return num.toFixed(0);
+}
+
+function formatPrice(price) {
+    if (!price) return '0';
+    if (price < 0.00000001) return price.toExponential(2);
+    if (price < 0.0001) return price.toFixed(10).replace(/\.?0+$/, '');
+    if (price < 0.01) return price.toFixed(6);
+    if (price < 1) return price.toFixed(4);
+    return price.toFixed(2);
+}
+
+function getTimeAgo(timestamp) {
+    const minutes = Math.floor((Date.now() - timestamp) / 60000);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours / 24)}d ago`;
+}
+
+// ==================== BOT COMMANDS ====================
+
+bot.start((ctx) => {
+    // Check if user came from "BUY VIP" button (start=vip)
+    const startPayload = ctx.startPayload;
+
+    if (startPayload === 'vip') {
+        // Go directly to VIP purchase
+        const orderId = generateOrderId();
+        const telegramId = ctx.from.id;
+
+        pendingPayments.set(orderId, {
+            telegramId: telegramId,
+            orderId: orderId,
+            createdAt: Date.now()
+        });
+
+        return ctx.replyWithMarkdown(`
+💎 *VIP SUBSCRIPTION*
+
+Get *INSTANT* access to all calls!
+No more 2 minute delay.
+
+━━━━━━━━━━━━━━━━━━━━
+💰 *Price:* ${SUBSCRIPTION_CONFIG.priceSOL} SOL / month
+━━━━━━━━━━━━━━━━━━━━
+
+📋 *How to subscribe:*
+
+1️⃣ Send *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
+\`${SUBSCRIPTION_CONFIG.walletAddress}\`
+
+2️⃣ After sending, click "✅ I Paid"
+
+🔐 *Your Order ID:* \`${orderId}\`
+
+⏰ Payment valid for 1 hour
+        `, {
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '✅ I Paid', callback_data: `check_payment_${orderId}` }],
+                    [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+                ]
+            }
+        });
+    }
+
+    // Normal start - show menu
+    ctx.replyWithMarkdown(`
+🚀 *Welcome to 1000x Call Bot!*
+
+The fastest Pump.fun migration alerts.
+
+💎 *PAID* - Instant calls
+🆓 *FREE* - 2 minute delay
+
+Choose an option below:
+    `, {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '📊 Info', callback_data: 'menu_info' },
+                    { text: '💎 Buy VIP', callback_data: 'menu_vip' }
+                ],
+                [
+                    { text: '📈 Stats', callback_data: 'menu_stats' },
+                    { text: '🔍 Status', callback_data: 'menu_status' }
+                ],
+                [
+                    { text: '💬 Support', callback_data: 'menu_support' },
+                    { text: '📢 Channels', callback_data: 'menu_channels' }
+                ]
+            ]
+        }
+    });
+});
+
+// Main menu command
+bot.command('menu', (ctx) => {
+    ctx.replyWithMarkdown(`
+🚀 *1000x Call Bot Menu*
+
+Choose an option:
+    `, {
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '📊 Info', callback_data: 'menu_info' },
+                    { text: '💎 Buy VIP', callback_data: 'menu_vip' }
+                ],
+                [
+                    { text: '📈 Stats', callback_data: 'menu_stats' },
+                    { text: '🔍 Status', callback_data: 'menu_status' }
+                ],
+                [
+                    { text: '💬 Support', callback_data: 'menu_support' },
+                    { text: '📢 Channels', callback_data: 'menu_channels' }
+                ]
+            ]
+        }
+    });
+});
+
+// Menu button handlers
+bot.action('menu_info', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+📊 *What is 1000x Call Bot?*
+
+We track Pump.fun token migrations to Raydium in real-time.
+
+✅ Instant migration alerts
+✅ Price milestone tracking (2x, 5x, 10x+)
+✅ Safety score analysis
+✅ Token socials & links
+
+💎 *VIP* = Instant calls
+🆓 *FREE* = 2 min delay
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('menu_vip', async (ctx) => {
+    await ctx.answerCbQuery();
+    const orderId = generateOrderId();
+    const telegramId = ctx.from.id;
+
+    pendingPayments.set(orderId, {
+        telegramId: telegramId,
+        orderId: orderId,
+        createdAt: Date.now()
+    });
+
+    await ctx.editMessageText(`
+💎 *VIP SUBSCRIPTION*
+
+Get *INSTANT* access to all calls!
+No more 2 minute delay.
+
+━━━━━━━━━━━━━━━━━━━━
+💰 *Price:* ${SUBSCRIPTION_CONFIG.priceSOL} SOL / month
+━━━━━━━━━━━━━━━━━━━━
+
+📋 *How to subscribe:*
+
+1️⃣ Send *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
+\`${SUBSCRIPTION_CONFIG.walletAddress}\`
+
+2️⃣ After sending, click "✅ I Paid"
+
+🔐 *Your Order ID:* \`${orderId}\`
+
+⏰ Payment valid for 1 hour
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '✅ I Paid', callback_data: `check_payment_${orderId}` }],
+                [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('menu_stats', async (ctx) => {
+    await ctx.answerCbQuery();
+
+    let x2to5 = 0, x5to15 = 0, x15to50 = 0, x50plus = 0, under2x = 0;
+    for (const [, data] of performanceHistory) {
+        const maxX = data.maxX || 1;
+        if (maxX >= 50) x50plus++;
+        else if (maxX >= 15) x15to50++;
+        else if (maxX >= 5) x5to15++;
+        else if (maxX >= 2) x2to5++;
+        else under2x++;
+    }
+    const totalCalls = performanceHistory.size;
+    const pct = (n) => totalCalls > 0 ? ((n / totalCalls) * 100).toFixed(1) : '0.0';
+
+    await ctx.editMessageText(`
+📈 *BOT STATISTICS*
+
+🚀 *50x+:* ${x50plus} (${pct(x50plus)}%)
+🔥 *15x-50x:* ${x15to50} (${pct(x15to50)}%)
+💎 *5x-15x:* ${x5to15} (${pct(x5to15)}%)
+✅ *2x-5x:* ${x2to5} (${pct(x2to5)}%)
+
+📞 *Total Calls:* ${totalCalls}
+📡 *Tracking:* ${trackedTokens.size} tokens
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('menu_status', async (ctx) => {
+    await ctx.answerCbQuery();
+    const uptime = Math.floor((Date.now() - stats.startedAt) / 60000);
+
+    await ctx.editMessageText(`
+🔍 *BOT STATUS*
+
+🟢 Status: Online
+⏱️ Uptime: ${uptime} minutes
+📡 Tracking: Pump.fun migrations
+📈 Tokens tracked: ${trackedTokens.size}
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('menu_support', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+💬 *SUPPORT*
+
+Need help? Contact us:
+
+👤 @imthebestever1
+👤 @nebezinaunieka
+
+We typically respond within 24 hours.
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('menu_channels', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+📢 *OUR CHANNELS*
+
+💎 *VIP Channel:* Instant calls
+   (Subscribe to get access)
+
+🆓 *Free Channel:* ${FREE_CHANNEL_ID}
+   (2 min delay)
+
+Join FREE channel to see our calls!
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🆓 Join FREE', url: `https://t.me/${FREE_CHANNEL_ID.replace('@', '')}` }],
+                [{ text: '💎 Get VIP Access', callback_data: 'menu_vip' }],
+                [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+            ]
+        }
+    });
+});
+
+bot.action('menu_back', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+🚀 *1000x Call Bot Menu*
+
+Choose an option:
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '📊 Info', callback_data: 'menu_info' },
+                    { text: '💎 Buy VIP', callback_data: 'menu_vip' }
+                ],
+                [
+                    { text: '📈 Stats', callback_data: 'menu_stats' },
+                    { text: '🔍 Status', callback_data: 'menu_status' }
+                ],
+                [
+                    { text: '💬 Support', callback_data: 'menu_support' },
+                    { text: '📢 Channels', callback_data: 'menu_channels' }
+                ]
+            ]
+        }
+    });
+});
+
+bot.command('status', (ctx) => {
+    const uptime = Math.floor((Date.now() - stats.startedAt) / 60000);
+    ctx.replyWithMarkdown(`
+📊 *Bot Status*
+
+🟢 Status: Online
+⏱️ Uptime: ${uptime} minutes
+📡 Tracking: Pump.fun migrations
+📈 Tokens tracked: ${trackedTokens.size}
+📢 Channel: ${CHANNEL_ID}
+    `);
+});
+
+bot.command('stats', (ctx) => {
+    // Calculate performance breakdown from performanceHistory
+    let x2to5 = 0;      // 2x - 5x
+    let x5to15 = 0;     // 5x - 15x
+    let x15to50 = 0;    // 15x - 50x
+    let x50plus = 0;    // 50x+
+    let under2x = 0;    // < 2x
+
+    for (const [, data] of performanceHistory) {
+        const maxX = data.maxX || 1;
+        if (maxX >= 50) {
+            x50plus++;
+        } else if (maxX >= 15) {
+            x15to50++;
+        } else if (maxX >= 5) {
+            x5to15++;
+        } else if (maxX >= 2) {
+            x2to5++;
+        } else {
+            under2x++;
+        }
+    }
+
+    const totalCalls = performanceHistory.size;
+    const uptimeMs = Date.now() - stats.startedAt;
+    const uptimeHours = Math.floor(uptimeMs / (1000 * 60 * 60));
+    const uptimeMins = Math.floor((uptimeMs % (1000 * 60 * 60)) / (1000 * 60));
+
+    // Calculate percentages
+    const pct = (n) => totalCalls > 0 ? ((n / totalCalls) * 100).toFixed(1) : '0.0';
+
+    ctx.replyWithMarkdown(`
+📊 *CALL BOT STATISTICS*
+
+⏱️ *Uptime:* ${uptimeHours}h ${uptimeMins}m
+📅 *Started:* ${new Date(stats.startedAt).toLocaleString()}
+
+━━━━━━━━━━━━━━━━━━━━
+📈 *PERFORMANCE BREAKDOWN*
+━━━━━━━━━━━━━━━━━━━━
+
+🚀 *50x+:* ${x50plus} calls (${pct(x50plus)}%)
+🔥 *15x - 50x:* ${x15to50} calls (${pct(x15to50)}%)
+💎 *5x - 15x:* ${x5to15} calls (${pct(x5to15)}%)
+✅ *2x - 5x:* ${x2to5} calls (${pct(x2to5)}%)
+❌ *Under 2x:* ${under2x} calls (${pct(under2x)}%)
+
+━━━━━━━━━━━━━━━━━━━━
+📋 *TOTALS*
+━━━━━━━━━━━━━━━━━━━━
+
+📞 Total Calls: ${totalCalls}
+🔍 Tokens Scanned: ${stats.tokensScanned}
+🚫 Filtered Out: ${stats.tokensFiltered}
+📡 Currently Tracking: ${trackedTokens.size}
+    `);
+});
+
+bot.command('tracking', (ctx) => {
+    if (trackedTokens.size === 0) {
+        ctx.reply('No tokens being tracked yet.');
+        return;
+    }
+
+    let message = '📈 *Tracked Tokens*\n\n';
+    let count = 0;
+
+    for (const [address, data] of trackedTokens) {
+        if (count >= 10) break;
+        message += `• *${data.symbol}* - ${data.lastMilestone}x reached\n`;
+        count++;
+    }
+
+    ctx.replyWithMarkdown(message);
+});
+
+bot.command('help', (ctx) => {
+    ctx.replyWithMarkdown(`
+❓ *Help*
+
+This bot:
+1. Detects new Pump.fun migrations
+2. Posts calls to the channel
+3. Tracks prices after calling
+4. Alerts when tokens hit 2x, 5x, 10x+
+
+*Commands:*
+/status - Bot status
+/stats - Statistics
+/tracking - View tracked tokens
+/subscribe - Get PAID access
+/paid - Verify payment
+
+*Join:* ${CHANNEL_ID}
+    `);
+});
+
+// ==================== ADMIN COMMANDS ====================
+
+bot.command('invite', async (ctx) => {
+    const userId = ctx.from.id;
+
+    // Check if user is admin
+    if (!ADMIN_IDS.includes(userId)) {
+        return ctx.reply('❌ Access denied.');
+    }
+
+    try {
+        const inviteLink = await bot.telegram.createChatInviteLink(SUBSCRIPTION_CONFIG.paidGroupChatId, {
+            member_limit: 1,
+            expire_date: Math.floor(Date.now() / 1000) + 86400 * 7, // 7 days
+            name: `Admin_${Date.now()}`
+        });
+
+        ctx.replyWithMarkdown(`
+🔐 *ADMIN INVITE LINK*
+
+👇 One-time use link (expires in 7 days):
+${inviteLink.invite_link}
+        `);
+    } catch (error) {
+        ctx.reply(`❌ Error: ${error.message}`);
+    }
+});
+
+// ==================== SUBSCRIPTION COMMANDS ====================
+
+bot.command('subscribe', (ctx) => {
+    const orderId = generateOrderId();
+    const telegramId = ctx.from.id;
+
+    // Store pending payment
+    pendingPayments.set(orderId, {
+        telegramId: telegramId,
+        orderId: orderId,
+        createdAt: Date.now()
+    });
+
+    // Clean up old pending payments (older than 2 hours)
+    const twoHoursAgo = Date.now() - (2 * 60 * 60 * 1000);
+    for (const [key, value] of pendingPayments) {
+        if (value.createdAt < twoHoursAgo) {
+            pendingPayments.delete(key);
+        }
+    }
+
+    ctx.replyWithMarkdown(`
+💎 *PREMIUM SUBSCRIPTION*
+
+Get *INSTANT* access to all calls!
+No more 2 minute delay.
+
+━━━━━━━━━━━━━━━━━━━━
+💰 *Price:* ${SUBSCRIPTION_CONFIG.priceSOL} SOL / month
+━━━━━━━━━━━━━━━━━━━━
+
+📋 *How to subscribe:*
+
+1️⃣ Send *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
+\`${SUBSCRIPTION_CONFIG.walletAddress}\`
+
+2️⃣ After sending, click /paid to verify
+
+━━━━━━━━━━━━━━━━━━━━
+
+🔐 *Your Order ID:* \`${orderId}\`
+_(Add this to memo if possible)_
+
+⏰ Payment valid for 1 hour
+
+💡 _Tip: Copy wallet address by tapping on it_
+    `, {
+        reply_markup: {
+            inline_keyboard: [[
+                { text: '📋 Copy Wallet', callback_data: `copy_wallet` },
+                { text: '✅ I Paid', callback_data: `check_payment_${orderId}` }
+            ]]
+        }
+    });
+});
+
+bot.command('paid', async (ctx) => {
+    const telegramId = ctx.from.id;
+
+    // Find user's pending payment
+    let userOrderId = null;
+    for (const [orderId, data] of pendingPayments) {
+        if (data.telegramId === telegramId) {
+            userOrderId = orderId;
+            break;
+        }
+    }
+
+    if (!userOrderId) {
+        ctx.reply('❌ No pending payment found. Use /subscribe first.');
+        return;
+    }
+
+    await ctx.reply('🔍 Checking payment... Please wait.');
+
+    const result = await checkPayment(userOrderId, SUBSCRIPTION_CONFIG.priceSOL);
+
+    if (result.success) {
+        // Mark as verified
+        verifiedPayments.add(result.signature);
+        pendingPayments.delete(userOrderId);
+
+        // Generate unique one-time invite link
+        const uniqueLink = await generateUniqueInviteLink(telegramId);
+
+        if (uniqueLink) {
+            ctx.replyWithMarkdown(`
+✅ *PAYMENT VERIFIED!*
+
+💰 Amount: ${result.amount.toFixed(4)} SOL
+🔗 TX: \`${result.signature.substring(0, 20)}...\`
+
+━━━━━━━━━━━━━━━━━━━━
+
+🎉 *Welcome to PREMIUM!*
+
+👇 Your *PERSONAL* invite link (1-time use, expires in 24h):
+            `, {
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '🚀 JOIN PAID GROUP', url: uniqueLink }
+                    ]]
+                }
+            });
+        } else {
+            ctx.replyWithMarkdown(`
+✅ *PAYMENT VERIFIED!*
+
+💰 Amount: ${result.amount.toFixed(4)} SOL
+
+⚠️ Could not generate invite link. Please contact @your_support
+            `);
+        }
+
+        console.log(`💰 New subscriber! User: ${telegramId}, TX: ${result.signature}, Link: ${uniqueLink}`);
+    } else {
+        ctx.replyWithMarkdown(`
+⏳ *Payment not found yet*
+
+Make sure you sent *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
+\`${SUBSCRIPTION_CONFIG.walletAddress}\`
+
+_Transactions may take 1-2 minutes to appear._
+_Try /paid again in a moment._
+
+❓ If you already paid, contact @your_support
+        `);
+    }
+});
+
+// Handle callback buttons
+bot.action('copy_wallet', (ctx) => {
+    ctx.answerCbQuery(`Wallet: ${SUBSCRIPTION_CONFIG.walletAddress}`);
+});
+
+bot.action(/check_payment_(.+)/, async (ctx) => {
+    const orderId = ctx.match[1];
+    const userId = ctx.from.id;
+
+    await ctx.answerCbQuery('🔍 Checking payment...');
+
+    const result = await checkPayment(orderId, SUBSCRIPTION_CONFIG.priceSOL);
+
+    if (result.success) {
+        verifiedPayments.add(result.signature);
+        pendingPayments.delete(orderId);
+
+        // Generate unique one-time invite link
+        const uniqueLink = await generateUniqueInviteLink(userId);
+
+        if (uniqueLink) {
+            await ctx.editMessageText(`
+✅ *PAYMENT VERIFIED!*
+
+💰 Amount: ${result.amount.toFixed(4)} SOL
+
+🎉 *Welcome to PREMIUM!*
+
+👇 Your *PERSONAL* invite link (1-time use, expires in 24h):
+            `, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [[
+                        { text: '🚀 JOIN PAID GROUP', url: uniqueLink }
+                    ]]
+                }
+            });
+        } else {
+            await ctx.editMessageText(`
+✅ *PAYMENT VERIFIED!*
+
+💰 Amount: ${result.amount.toFixed(4)} SOL
+
+⚠️ Could not generate invite link. Please contact @your_support
+            `, { parse_mode: 'Markdown' });
+        }
+
+        console.log(`💰 New subscriber! User: ${userId}, TX: ${result.signature}, Link: ${uniqueLink}`);
+    } else {
+        await ctx.reply('⏳ Payment not found yet. Make sure you sent the correct amount and try again in 1-2 minutes.');
+    }
+});
+
+// ==================== MIGRATION HANDLER ====================
+
+// Helper function to send call to a channel
+async function sendCallToChannel(channelId, message, imageBuffer, channelName = 'PAID') {
+    const replyMarkup = {
+        inline_keyboard: [
+            [
+                { text: '🔫 REKTsol', url: 'https://t.me/REKTsol_bot?start=callbot' },
+                { text: '🤖 Maestro', url: 'https://t.me/maestro?start=r-imthebestever1' }
+            ],
+            [
+                { text: '💎 BUY VIP', url: 'https://t.me/Degens_1000x_call_bot' }
+            ]
+        ]
+    };
+
+    try {
+        if (imageBuffer) {
+            const sentMessage = await bot.telegram.sendPhoto(channelId, {
+                source: imageBuffer,
+                filename: 'token.png'
+            }, {
+                caption: message,
+                parse_mode: 'Markdown',
+                reply_markup: replyMarkup
+            });
+            console.log(`📢 [${channelName}] Call with photo sent`);
+            return sentMessage.message_id;
+        } else {
+            const sentMessage = await bot.telegram.sendMessage(channelId, message, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+                reply_markup: replyMarkup
+            });
+            console.log(`📢 [${channelName}] Call sent as text`);
+            return sentMessage.message_id;
+        }
+    } catch (error) {
+        console.error(`[${channelName}] Failed to send call:`, error.message);
+        return null;
+    }
+}
+
+tracker.on('newMigration', async (token) => {
+    stats.tokensScanned++;
+
+    console.log(`📡 Scanning: ${token.name} (${token.symbol})`);
+
+    // AUTO TRADING - pirkti tokeną automatiškai
+    try {
+        await autoTrader.handleNewMigration(token, bot);
+    } catch (error) {
+        console.error('[AUTO-TRADER] Error:', error.message);
+    }
+
+    // Duplicate call prevention - skip if already called in last 5 minutes
+    if (recentlyCalled.has(token.address)) {
+        console.log(`⏭️ SKIP: ${token.symbol} already called recently`);
+        return;
+    }
+
+    const filterResult = tracker.checkFilters(token, FILTERS);
+
+    if (!filterResult.passed) {
+        stats.tokensFiltered++;
+        console.log(`❌ Filtered out: ${token.symbol}`);
+        return;
+    }
+
+    const safety = await tracker.getSafetyScore(token);
+
+    console.log(`✅ CALL: ${token.name} (${token.symbol}) - Risk: ${safety.risk}`);
+
+    const message = formatCallMessage(token, safety);
+
+    // Download image using multiple sources
+    let imageBuffer = null;
+    let imageUrl = token.image;
+
+    // Helper function to convert IPFS URL to working gateway
+    const getWorkingIpfsUrl = (url) => {
+        if (!url) return null;
+        // Extract IPFS hash from various URL formats
+        let hash = null;
+        if (url.includes('/ipfs/')) {
+            hash = url.split('/ipfs/')[1];
+        } else if (url.includes('ipfs://')) {
+            hash = url.replace('ipfs://', '');
+        }
+        if (hash) {
+            // Use Cloudflare IPFS gateway (no SSL issues)
+            return `https://cloudflare-ipfs.com/ipfs/${hash}`;
+        }
+        return url;
+    };
+
+    // Step 1: Try DexScreener CDN first (most reliable, no SSL issues)
+    try {
+        const dexResponse = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${token.address}`, { timeout: 10000 });
+        const dexImage = dexResponse.data?.pairs?.[0]?.info?.imageUrl;
+
+        if (dexImage && dexImage.includes('cdn.dexscreener.com')) {
+            console.log(`   📷 Trying DexScreener CDN...`);
+            const response = await axios.get(dexImage, {
+                responseType: 'arraybuffer',
+                timeout: 10000,
+                headers: { 'User-Agent': 'Mozilla/5.0', 'Referer': 'https://dexscreener.com' }
+            });
+            if (response.data && response.data.length > 500) {
+                imageBuffer = Buffer.from(response.data);
+                console.log(`   ✅ Image from DexScreener CDN`);
+            }
+        }
+    } catch (e) {
+        console.log(`   ⚠️ DexScreener CDN failed: ${e.message}`);
+    }
+
+    // Step 2: Try SVS API with Cloudflare IPFS gateway
+    if (!imageBuffer && imageUrl) {
+        const workingUrl = getWorkingIpfsUrl(imageUrl);
+        if (workingUrl && workingUrl !== imageUrl) {
+            try {
+                console.log(`   📷 Trying Cloudflare IPFS gateway...`);
+                const response = await axios.get(workingUrl, {
+                    responseType: 'arraybuffer',
+                    timeout: 15000,
+                    headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'image/*' }
+                });
+                if (response.data && response.data.length > 500) {
+                    imageBuffer = Buffer.from(response.data);
+                    console.log(`   ✅ Image from Cloudflare IPFS`);
+                }
+            } catch (e) {
+                console.log(`   ⚠️ Cloudflare IPFS failed: ${e.message}`);
+            }
+        }
+    }
+
+    // Step 3: Try other IPFS gateways
+    if (!imageBuffer && imageUrl && imageUrl.includes('ipfs')) {
+        const hash = imageUrl.includes('/ipfs/') ? imageUrl.split('/ipfs/')[1] : null;
+        if (hash) {
+            const gateways = [
+                `https://gateway.pinata.cloud/ipfs/${hash}`,
+                `https://dweb.link/ipfs/${hash}`,
+                `https://ipfs.filebase.io/ipfs/${hash}`
+            ];
+            for (const gateway of gateways) {
+                try {
+                    console.log(`   📷 Trying: ${gateway.substring(0, 45)}...`);
+                    const response = await axios.get(gateway, {
+                        responseType: 'arraybuffer',
+                        timeout: 10000,
+                        headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'image/*' }
+                    });
+                    if (response.data && response.data.length > 500) {
+                        imageBuffer = Buffer.from(response.data);
+                        console.log(`   ✅ Image from IPFS gateway`);
+                        break;
+                    }
+                } catch (e) {
+                    // Try next gateway
+                }
+            }
+        }
+    }
+
+    // Step 4: Try non-IPFS URL directly
+    if (!imageBuffer && imageUrl && !imageUrl.includes('ipfs.io')) {
+        try {
+            console.log(`   📷 Trying direct URL...`);
+            const response = await axios.get(imageUrl, {
+                responseType: 'arraybuffer',
+                timeout: 10000,
+                headers: { 'User-Agent': 'Mozilla/5.0', 'Accept': 'image/*', 'Referer': 'https://dexscreener.com' }
+            });
+            if (response.data && response.data.length > 500) {
+                imageBuffer = Buffer.from(response.data);
+                console.log(`   ✅ Image from direct URL`);
+            }
+        } catch (e) {
+            console.log(`   ⚠️ Direct URL failed: ${e.message}`);
+        }
+    }
+
+    if (!imageBuffer) {
+        console.log(`   ❌ No image available`);
+    }
+
+    // Send to PAID channel (instant)
+    const paidMessageId = await sendCallToChannel(CHANNEL_ID, message, imageBuffer, 'PAID');
+
+    if (paidMessageId) {
+        stats.callsSent++;
+
+        // Add to recently called set to prevent duplicates
+        recentlyCalled.add(token.address);
+        // Remove from set after 5 minutes
+        setTimeout(() => recentlyCalled.delete(token.address), 5 * 60 * 1000);
+    }
+
+    // Send to FREE channel (delayed)
+    if (FREE_CHANNEL_ID) {
+        setTimeout(async () => {
+            const freeMessageId = await sendCallToChannel(FREE_CHANNEL_ID, message, imageBuffer, 'FREE');
+
+            // Update tracked token with FREE message ID for milestone replies
+            if (freeMessageId && trackedTokens.has(token.address)) {
+                trackedTokens.get(token.address).freeMessageId = freeMessageId;
+                console.log(`   📌 FREE message ID stored for ${token.symbol}`);
+            }
+        }, FREE_DELAY_MS);
+    }
+
+    // Track token for milestones (initially without FREE message ID)
+    trackToken(token, paidMessageId, null);
+});
+
+// ==================== ERROR HANDLING ====================
+
+bot.catch((err, ctx) => {
+    console.error('Bot error:', err);
+});
+
+process.on('uncaughtException', (err) => {
+    console.error('Uncaught exception:', err);
+});
+
+let launchRetries = 0;
+const maxLaunchRetries = 5;
+
+process.on('unhandledRejection', async (err) => {
+    if (err.response?.error_code === 409) {
+        launchRetries++;
+        if (launchRetries <= maxLaunchRetries) {
+            console.log(`⚠️ Bot conflict detected (attempt ${launchRetries}/${maxLaunchRetries})`);
+            console.log('   Waiting 10 seconds before retry...');
+            await new Promise(resolve => setTimeout(resolve, 10000));
+            console.log('🔄 Retrying bot launch...');
+            bot.launch({ dropPendingUpdates: true }).catch(() => {});
+        } else {
+            console.error('❌ Could not start bot after multiple attempts.');
+            console.error('   Make sure no other bot instance is running anywhere.');
+            process.exit(1);
+        }
+    } else {
+        console.error('Unhandled rejection:', err);
+    }
+});
+
+// ==================== 24H DAILY STATS ====================
+
+// Store 24h stats
+let daily24hStats = {
+    calls: 0,
+    x2: 0,
+    x5: 0,
+    x10: 0,
+    x50: 0,
+    lastReset: Date.now()
+};
+
+// Track 24h performance for daily report
+function update24hStats(milestone) {
+    if (milestone >= 50) daily24hStats.x50++;
+    else if (milestone >= 10) daily24hStats.x10++;
+    else if (milestone >= 5) daily24hStats.x5++;
+    else if (milestone >= 2) daily24hStats.x2++;
+}
+
+// Send daily stats at 15:00
+async function sendDailyStats() {
+    const now = new Date();
+
+    // Calculate totals from performanceHistory (last 24h)
+    const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+    let calls24h = 0;
+    let x2 = 0, x5 = 0, x10 = 0, x20 = 0, x30 = 0, x50 = 0, x100 = 0, x200 = 0;
+    let under2x = 0;
+
+    for (const [, data] of performanceHistory) {
+        if (data.calledAt >= oneDayAgo) {
+            calls24h++;
+            const maxX = data.maxX || 1;
+
+            if (maxX >= 200) x200++;
+            else if (maxX >= 100) x100++;
+            else if (maxX >= 50) x50++;
+            else if (maxX >= 30) x30++;
+            else if (maxX >= 20) x20++;
+            else if (maxX >= 10) x10++;
+            else if (maxX >= 5) x5++;
+            else if (maxX >= 2) x2++;
+            else under2x++;
+        }
+    }
+
+    const successCount = x2 + x5 + x10 + x20 + x30 + x50 + x100 + x200;
+    const successRate = calls24h > 0 ? ((successCount / calls24h) * 100).toFixed(1) : '0.0';
+
+    const statsMessage = `
+📊 *24H DAILY REPORT*
+━━━━━━━━━━━━━━━━━━━━
+
+📅 *Date:* ${now.toLocaleDateString('en-GB')}
+
+📞 *Total Calls:* ${calls24h}
+
+━━━━━━━━━━━━━━━━━━━━
+🎯 *PERFORMANCE*
+━━━━━━━━━━━━━━━━━━━━
+
+👑 200x+: ${x200}
+💎 100x+: ${x100}
+🚀 50x+: ${x50}
+🔥 30x+: ${x30}
+⚡ 20x+: ${x20}
+✨ 10x+: ${x10}
+💰 5x+: ${x5}
+✅ 2x+: ${x2}
+
+❌ *Under 2x:* ${under2x}
+
+━━━━━━━━━━━━━━━━━━━━
+📈 *Success Rate:* ${successRate}%
+_(2x or higher)_
+━━━━━━━━━━━━━━━━━━━━
+
+💎 Get VIP for instant calls!
+@callbot1000x
+    `;
+
+    try {
+        // Send to PAID channel and pin
+        const paidMsg = await bot.telegram.sendMessage(CHANNEL_ID, statsMessage, {
+            parse_mode: 'Markdown'
+        });
+        await bot.telegram.pinChatMessage(CHANNEL_ID, paidMsg.message_id, { disable_notification: true });
+        console.log('📊 Daily stats sent & pinned to PAID channel');
+
+        // Send to FREE channel and pin
+        if (FREE_CHANNEL_ID) {
+            const freeMsg = await bot.telegram.sendMessage(FREE_CHANNEL_ID, statsMessage, {
+                parse_mode: 'Markdown'
+            });
+            await bot.telegram.pinChatMessage(FREE_CHANNEL_ID, freeMsg.message_id, { disable_notification: true });
+            console.log('📊 Daily stats sent & pinned to FREE channel');
+        }
+    } catch (error) {
+        console.error('Error sending daily stats:', error.message);
+    }
+}
+
+// Check if it's 15:00 and send daily stats
+function scheduleDailyStats() {
+    setInterval(() => {
+        const now = new Date();
+        // Check if it's 15:00 (3 PM) - checks every minute
+        if (now.getHours() === 15 && now.getMinutes() === 0) {
+            sendDailyStats();
+        }
+    }, 60000); // Check every minute
+
+    console.log('✅ Daily stats scheduled for 15:00');
+}
+
+// ==================== START BOT ====================
+
+async function start() {
+    console.log('');
+    console.log('🚀 ================================');
+    console.log('   1000x CALL BOT - Pump.fun');
+    console.log('🚀 ================================');
+    console.log('');
+
+    // Clear any existing webhook and drop pending updates
+    await bot.telegram.deleteWebhook({ drop_pending_updates: true });
+    console.log('🔄 Cleared webhook and pending updates');
+
+    // Start the tracker first (doesn't depend on Telegram)
+    await tracker.startTracking();
+    console.log('✅ Migration tracker started');
+
+    // Start auto trading position monitoring
+    autoTrader.startPositionMonitoring(bot);
+    console.log('✅ Auto-trader position monitoring started');
+
+    // Check milestones every 15 seconds
+    setInterval(checkMilestones, 15000);
+    console.log('✅ Price tracker started (checks every 15s)');
+
+    // Schedule daily stats at 15:00
+    scheduleDailyStats();
+
+    console.log(`📢 PAID channel: ${CHANNEL_ID} (instant)`);
+    if (FREE_CHANNEL_ID) {
+        console.log(`📢 FREE channel: ${FREE_CHANNEL_ID} (${FREE_DELAY_MS / 1000}s delay)`);
+    }
+
+    // Launch bot (will retry via unhandledRejection handler if 409)
+    console.log('🔄 Launching Telegram bot...');
+    bot.launch({ dropPendingUpdates: true }).then(() => {
+        console.log('✅ Telegram bot started successfully!');
+        console.log('');
+        console.log('👀 Watching for new migrations...');
+        console.log('');
+    }).catch(() => {
+        // Error will be handled by unhandledRejection handler
+    });
+}
+
+start();
+
+process.once('SIGINT', () => {
+    tracker.stopTracking();
+    bot.stop('SIGINT');
+});
+process.once('SIGTERM', () => {
+    tracker.stopTracking();
+    bot.stop('SIGTERM');
+});
