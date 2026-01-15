@@ -67,11 +67,11 @@ function formatCallMessage(token, safety) {
 
 <a href="https://dexscreener.com/solana/${token.address}">Dex</a> | <a href="https://birdeye.so/token/${token.address}?chain=solana">Birdeye</a> | <a href="https://photon-sol.tinyastro.io/en/lp/${token.address}">Photon</a> | <a href="https://pump.fun/${token.address}">Pump</a> | <a href="https://rugcheck.xyz/tokens/${token.address}">RugCheck</a>
 
-💎 Join VIP and get signals first.
-(Free group has a 2-minute delay)
+💎 Join VIP for premium signals without delay.
+🎁 FREE group has no delay until end of January!
 ⚠️ Always DYOR!
 
-Our VIP members get instant calls and more premium signals than the public group. 👉 @Degens_1000x_call_bot`;
+👉 @Degens_1000x_call_bot`;
 
     return message;
 }
