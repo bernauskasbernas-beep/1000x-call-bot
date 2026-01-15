@@ -967,14 +967,14 @@ async function sendCallToChannel(channelId, message, imageBuffer, channelName = 
                 filename: 'token.png'
             }, {
                 caption: message,
-                parse_mode: 'Markdown',
+                parse_mode: 'HTML',
                 reply_markup: replyMarkup
             });
             console.log(`📢 [${channelName}] Call with photo sent`);
             return sentMessage.message_id;
         } else {
             const sentMessage = await bot.telegram.sendMessage(channelId, message, {
-                parse_mode: 'Markdown',
+                parse_mode: 'HTML',
                 disable_web_page_preview: true,
                 reply_markup: replyMarkup
             });

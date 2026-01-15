@@ -1,11 +1,13 @@
-// Remove problematic Markdown characters (simple removal, not escaping)
-function cleanText(text) {
+// Escape HTML special characters
+function escapeHtml(text) {
     if (!text) return '';
     return String(text)
-        .replace(/[_*\[\]`~]/g, '');
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
 }
 
-// Format migration call message
+// Format migration call message (HTML format - more stable than Markdown)
 function formatCallMessage(token, safety) {
     // RugCheck score emoji
     const getRugEmoji = (score) => {
@@ -21,14 +23,14 @@ function formatCallMessage(token, safety) {
             ? `${token.ageMinutes}m ago`
             : `${Math.floor(token.ageMinutes / 60)}h ago`;
 
-    // Clean token name and symbol to remove problematic characters
-    const safeName = cleanText(token.name);
-    const safeSymbol = cleanText(token.symbol);
+    // Escape token name and symbol
+    const safeName = escapeHtml(token.name);
+    const safeSymbol = escapeHtml(token.symbol);
 
-    let message = `🚀 *NEW MIGRATION* 🚀
+    let message = `🚀 <b>NEW MIGRATION</b> 🚀
 
-📛 *${safeName}* ($${safeSymbol})
-📍 \`${token.address}\`
+📛 <b>${safeName}</b> ($${safeSymbol})
+📍 <code>${token.address}</code>
 
 💰 MC: $${formatNumber(token.marketCap)} | 💧 Liq: $${formatNumber(token.liquidity)}
 💵 Price: $${formatPrice(token.price)}
@@ -36,7 +38,7 @@ function formatCallMessage(token, safety) {
 
     // RugCheck info
     if (token.rugScore !== null) {
-        message += `\n\n🛡️ *RugCheck:* ${getRugEmoji(token.rugScore)} ${token.rugScore}/1000`;
+        message += `\n\n🛡️ <b>RugCheck:</b> ${getRugEmoji(token.rugScore)} ${token.rugScore}/1000`;
 
         // Top holders concentration
         if (token.topHolders?.top10Pct) {
@@ -46,16 +48,16 @@ function formatCallMessage(token, safety) {
 
         // Show top risks (max 2)
         if (token.rugRisks && token.rugRisks.length > 0) {
-            const topRisks = token.rugRisks.slice(0, 2).map(r => cleanText(r.name)).join(', ');
+            const topRisks = token.rugRisks.slice(0, 2).map(r => escapeHtml(r.name)).join(', ');
             message += `\n⚠️ ${topRisks}`;
         }
     }
 
     // Add socials if available
     let socials = [];
-    if (token.twitter) socials.push(`[TW](${token.twitter})`);
-    if (token.telegram) socials.push(`[TG](${token.telegram})`);
-    if (token.website) socials.push(`[Web](${token.website})`);
+    if (token.twitter) socials.push(`<a href="${token.twitter}">TW</a>`);
+    if (token.telegram) socials.push(`<a href="${token.telegram}">TG</a>`);
+    if (token.website) socials.push(`<a href="${token.website}">Web</a>`);
 
     if (socials.length > 0) {
         message += `\n\n🔗 ${socials.join(' | ')}`;
@@ -63,7 +65,7 @@ function formatCallMessage(token, safety) {
 
     message += `
 
-[Dex](https://dexscreener.com/solana/${token.address}) | [Birdeye](https://birdeye.so/token/${token.address}?chain=solana) | [Photon](https://photon-sol.tinyastro.io/en/lp/${token.address}) | [Pump](https://pump.fun/${token.address}) | [RugCheck](https://rugcheck.xyz/tokens/${token.address})
+<a href="https://dexscreener.com/solana/${token.address}">Dex</a> | <a href="https://birdeye.so/token/${token.address}?chain=solana">Birdeye</a> | <a href="https://photon-sol.tinyastro.io/en/lp/${token.address}">Photon</a> | <a href="https://pump.fun/${token.address}">Pump</a> | <a href="https://rugcheck.xyz/tokens/${token.address}">RugCheck</a>
 
 💎 Join VIP and get signals first.
 (Free group has a 2-minute delay)
@@ -74,19 +76,17 @@ Our VIP members get instant calls and more premium signals than the public group
     return message;
 }
 
-// Format simple alert
+// Format simple alert (HTML)
 function formatQuickAlert(token) {
-    const safeSymbol = cleanText(token.symbol);
-    return `
-🚀 *${safeSymbol}* migrated!
+    const safeSymbol = escapeHtml(token.symbol);
+    return `🚀 <b>${safeSymbol}</b> migrated!
 
 💰 MC: $${formatNumber(token.marketCap)}
 💧 Liq: $${formatNumber(token.liquidity)}
 
-\`${token.address}\`
+<code>${token.address}</code>
 
-[DexScreener](https://dexscreener.com/solana/${token.address})
-`;
+<a href="https://dexscreener.com/solana/${token.address}">DexScreener</a>`;
 }
 
 // Format price
