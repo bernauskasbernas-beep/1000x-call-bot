@@ -630,7 +630,7 @@ ${statusEmoji} Status: *${statusText}*
 *Current Settings:*
 💵 Trade Size: ${user.settings.tradeSize} SOL
 🎯 Take Profit: ${user.settings.takeProfitMultiplier}x
-🛑 Stop Loss: ${(user.settings.stopLossMultiplier * 100)}%
+🛑 Stop Loss: -${((1 - user.settings.stopLossMultiplier) * 100).toFixed(0)}%
 
 _When enabled, bot will auto-buy every call and auto-sell at TP/SL._
     `, {
@@ -693,7 +693,7 @@ bot.action('trading_settings', async (ctx) => {
 
 💵 *Trade Size:* ${user.settings.tradeSize} SOL
 🎯 *Take Profit:* ${user.settings.takeProfitMultiplier}x
-🛑 *Stop Loss:* ${(user.settings.stopLossMultiplier * 100)}%
+🛑 *Stop Loss:* -${((1 - user.settings.stopLossMultiplier) * 100).toFixed(0)}%
 📊 *Max Positions:* ${user.settings.maxPositions}
 
 _Tap a button to change setting:_
