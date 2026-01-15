@@ -1446,13 +1446,6 @@ tracker.on('newMigration', async (token) => {
 
     console.log(`📡 Scanning: ${token.name} (${token.symbol})`);
 
-    // AUTO TRADING - Execute trades for users with trading enabled
-    try {
-        await autoTrader.handleNewMigration(token, bot);
-    } catch (error) {
-        console.error('[AUTO-TRADER] Error:', error.message);
-    }
-
     // Duplicate call prevention - skip if already called in last 5 minutes
     if (recentlyCalled.has(token.address)) {
         console.log(`⏭️ SKIP: ${token.symbol} already called recently`);
@@ -1610,6 +1603,15 @@ tracker.on('newMigration', async (token) => {
 
     // Track token for milestones with both message IDs
     trackToken(token, paidMessageId, freeMessageId);
+
+    // AUTO TRADING - Execute trades ONLY for tokens that passed filters and were called
+    if (paidMessageId) {
+        try {
+            await autoTrader.handleNewMigration(token, bot);
+        } catch (error) {
+            console.error('[AUTO-TRADER] Error:', error.message);
+        }
+    }
 });
 
 // ==================== ERROR HANDLING ====================
