@@ -925,9 +925,9 @@ New max: *${max} positions*
     });
 });
 
-// Positions view
+// Positions view with live P&L
 bot.action('trading_positions', async (ctx) => {
-    await ctx.answerCbQuery();
+    await ctx.answerCbQuery('Loading positions...');
     const userId = ctx.from.id.toString();
     const user = autoTrader.getUserProfile(userId);
 
@@ -942,6 +942,7 @@ _When auto trading is enabled, bought tokens will appear here._
             parse_mode: 'Markdown',
             reply_markup: {
                 inline_keyboard: [
+                    [{ text: '🔄 Refresh', callback_data: 'trading_positions' }],
                     [{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]
                 ]
             }
@@ -951,19 +952,56 @@ _When auto trading is enabled, bought tokens will appear here._
 
     let posText = '';
     const buttons = [];
+    let totalPnlPct = 0;
 
     for (const pos of user.positions) {
         const ageMin = Math.floor((Date.now() - pos.boughtAt) / 60000);
+        const ageText = ageMin < 60 ? `${ageMin}m` : `${Math.floor(ageMin / 60)}h ${ageMin % 60}m`;
+
+        // Fetch current market cap from DexScreener
+        let pnlText = '';
+        let pnlPct = 0;
+        try {
+            const response = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${pos.tokenAddress}`);
+            const data = await response.json();
+            if (data.pairs && data.pairs.length > 0) {
+                const currentMC = data.pairs[0].fdv || data.pairs[0].marketCap || 0;
+                if (currentMC > 0 && pos.buyMC > 0) {
+                    const multiplier = currentMC / pos.buyMC;
+                    pnlPct = (multiplier - 1) * 100;
+                    totalPnlPct += pnlPct;
+
+                    const emoji = pnlPct >= 0 ? '🟢' : '🔴';
+                    const sign = pnlPct >= 0 ? '+' : '';
+                    pnlText = `${emoji} ${sign}${pnlPct.toFixed(1)}% (${multiplier.toFixed(2)}x)`;
+                } else {
+                    pnlText = '⏳ Calculating...';
+                }
+            } else {
+                pnlText = '❓ No data';
+            }
+        } catch (error) {
+            pnlText = '❓ Error';
+        }
+
         posText += `\n🪙 *${pos.symbol}*\n`;
-        posText += `   💰 ${pos.solSpent} SOL | ⏱️ ${ageMin}m ago\n`;
+        posText += `   💰 ${pos.solSpent} SOL | ⏱️ ${ageText}\n`;
+        posText += `   📊 ${pnlText}\n`;
 
         buttons.push([{ text: `🔴 Sell ${pos.symbol}`, callback_data: `sell_${pos.tokenAddress.substring(0, 20)}` }]);
     }
 
+    // Add refresh button at top
+    buttons.unshift([{ text: '🔄 Refresh Prices', callback_data: 'trading_positions' }]);
     buttons.push([{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]);
+
+    const avgPnl = user.positions.length > 0 ? totalPnlPct / user.positions.length : 0;
+    const avgEmoji = avgPnl >= 0 ? '📈' : '📉';
+    const avgSign = avgPnl >= 0 ? '+' : '';
 
     await ctx.editMessageText(`
 📊 *OPEN POSITIONS* (${user.positions.length}/${user.settings.maxPositions})
+${avgEmoji} Avg P&L: ${avgSign}${avgPnl.toFixed(1)}%
 ${posText}
 _Tap to manually sell:_
     `, {
