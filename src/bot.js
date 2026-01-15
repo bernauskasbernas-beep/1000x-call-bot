@@ -324,40 +324,27 @@ bot.start((ctx) => {
     const startPayload = ctx.startPayload;
 
     if (startPayload === 'vip') {
-        // Go directly to VIP purchase
-        const orderId = generateOrderId();
-        const telegramId = ctx.from.id;
-
-        pendingPayments.set(orderId, {
-            telegramId: telegramId,
-            orderId: orderId,
-            createdAt: Date.now()
-        });
-
+        // Go directly to VIP info
         return ctx.replyWithMarkdown(`
 💎 *VIP SUBSCRIPTION*
 
 Get *INSTANT* access to all calls!
-No more 2 minute delay.
+Premium signals and early access.
 
 ━━━━━━━━━━━━━━━━━━━━
-💰 *Price:* ${SUBSCRIPTION_CONFIG.priceSOL} SOL / month
+
+📩 *Contact owner for VIP access:*
+👤 @imthebestever1
+
 ━━━━━━━━━━━━━━━━━━━━
 
-📋 *How to subscribe:*
-
-1️⃣ Send *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
-\`${SUBSCRIPTION_CONFIG.walletAddress}\`
-
-2️⃣ After sending, click "✅ I Paid"
-
-🔐 *Your Order ID:* \`${orderId}\`
-
-⏰ Payment valid for 1 hour
+✅ Fast response
+✅ Secure payment
+✅ Instant access after payment
         `, {
             reply_markup: {
                 inline_keyboard: [
-                    [{ text: '✅ I Paid', callback_data: `check_payment_${orderId}` }],
+                    [{ text: '📩 Contact Owner', url: 'https://t.me/imthebestever1' }],
                     [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
                 ]
             }
@@ -447,40 +434,28 @@ We track Pump.fun token migrations to Raydium in real-time.
 
 bot.action('menu_vip', async (ctx) => {
     await ctx.answerCbQuery();
-    const orderId = generateOrderId();
-    const telegramId = ctx.from.id;
-
-    pendingPayments.set(orderId, {
-        telegramId: telegramId,
-        orderId: orderId,
-        createdAt: Date.now()
-    });
 
     await ctx.editMessageText(`
 💎 *VIP SUBSCRIPTION*
 
 Get *INSTANT* access to all calls!
-No more 2 minute delay.
+Premium signals and early access.
 
 ━━━━━━━━━━━━━━━━━━━━
-💰 *Price:* ${SUBSCRIPTION_CONFIG.priceSOL} SOL / month
+
+📩 *Contact owner for VIP access:*
+👤 @imthebestever1
+
 ━━━━━━━━━━━━━━━━━━━━
 
-📋 *How to subscribe:*
-
-1️⃣ Send *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
-\`${SUBSCRIPTION_CONFIG.walletAddress}\`
-
-2️⃣ After sending, click "✅ I Paid"
-
-🔐 *Your Order ID:* \`${orderId}\`
-
-⏰ Payment valid for 1 hour
+✅ Fast response
+✅ Secure payment
+✅ Instant access after payment
     `, {
         parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
-                [{ text: '✅ I Paid', callback_data: `check_payment_${orderId}` }],
+                [{ text: '📩 Contact Owner', url: 'https://t.me/imthebestever1' }],
                 [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
             ]
         }
@@ -756,55 +731,27 @@ ${inviteLink.invite_link}
 // ==================== SUBSCRIPTION COMMANDS ====================
 
 bot.command('subscribe', (ctx) => {
-    const orderId = generateOrderId();
-    const telegramId = ctx.from.id;
-
-    // Store pending payment
-    pendingPayments.set(orderId, {
-        telegramId: telegramId,
-        orderId: orderId,
-        createdAt: Date.now()
-    });
-
-    // Clean up old pending payments (older than 2 hours)
-    const twoHoursAgo = Date.now() - (2 * 60 * 60 * 1000);
-    for (const [key, value] of pendingPayments) {
-        if (value.createdAt < twoHoursAgo) {
-            pendingPayments.delete(key);
-        }
-    }
-
     ctx.replyWithMarkdown(`
-💎 *PREMIUM SUBSCRIPTION*
+💎 *VIP SUBSCRIPTION*
 
 Get *INSTANT* access to all calls!
-No more 2 minute delay.
-
-━━━━━━━━━━━━━━━━━━━━
-💰 *Price:* ${SUBSCRIPTION_CONFIG.priceSOL} SOL / month
-━━━━━━━━━━━━━━━━━━━━
-
-📋 *How to subscribe:*
-
-1️⃣ Send *${SUBSCRIPTION_CONFIG.priceSOL} SOL* to:
-\`${SUBSCRIPTION_CONFIG.walletAddress}\`
-
-2️⃣ After sending, click /paid to verify
+Premium signals and early access.
 
 ━━━━━━━━━━━━━━━━━━━━
 
-🔐 *Your Order ID:* \`${orderId}\`
-_(Add this to memo if possible)_
+📩 *Contact owner for VIP access:*
+👤 @imthebestever1
 
-⏰ Payment valid for 1 hour
+━━━━━━━━━━━━━━━━━━━━
 
-💡 _Tip: Copy wallet address by tapping on it_
+✅ Fast response
+✅ Secure payment
+✅ Instant access after payment
     `, {
         reply_markup: {
-            inline_keyboard: [[
-                { text: '📋 Copy Wallet', callback_data: `copy_wallet` },
-                { text: '✅ I Paid', callback_data: `check_payment_${orderId}` }
-            ]]
+            inline_keyboard: [
+                [{ text: '📩 Contact Owner', url: 'https://t.me/imthebestever1' }]
+            ]
         }
     });
 });
