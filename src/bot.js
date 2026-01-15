@@ -984,12 +984,12 @@ tracker.on('newMigration', async (token) => {
 
     console.log(`📡 Scanning: ${token.name} (${token.symbol})`);
 
-    // AUTO TRADING - pirkti tokeną automatiškai
-    try {
-        await autoTrader.handleNewMigration(token, bot);
-    } catch (error) {
-        console.error('[AUTO-TRADER] Error:', error.message);
-    }
+    // AUTO TRADING - DISABLED
+    // try {
+    //     await autoTrader.handleNewMigration(token, bot);
+    // } catch (error) {
+    //     console.error('[AUTO-TRADER] Error:', error.message);
+    // }
 
     // Duplicate call prevention - skip if already called in last 5 minutes
     if (recentlyCalled.has(token.address)) {
