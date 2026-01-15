@@ -245,24 +245,21 @@ async function sendMilestoneAlert(data, currentMC, currentPrice, multiplier, mil
 
     // Show exact multiplier with 2 decimal places (e.g. 2.17x, 5.43x)
     const exactX = multiplier.toFixed(2);
-    const message = `*${data.symbol}* gains ${rocketEmoji} ${exactX}x ${rocketEmoji}
+    const message = `<b>${data.symbol}</b> gains ${rocketEmoji} ${exactX}x ${rocketEmoji}
 💰 Call MC: $${formatNumber(data.initialMC)}
 💎 Current MC: $${formatNumber(currentMC)}`;
 
-    // Send to PAID channel (instant)
+    // Send to PAID channel
     try {
         const options = {
-            parse_mode: 'Markdown',
+            parse_mode: 'HTML',
             disable_web_page_preview: true
         };
 
         // Reply to original call message if we have messageId
         if (data.messageId) {
             console.log(`   📎 Replying to message ID: ${data.messageId}`);
-            options.reply_parameters = {
-                message_id: data.messageId,
-                allow_sending_without_reply: true
-            };
+            options.reply_to_message_id = data.messageId;
         } else {
             console.log(`   ⚠️ No messageId stored for ${data.symbol}`);
         }
@@ -273,30 +270,25 @@ async function sendMilestoneAlert(data, currentMC, currentPrice, multiplier, mil
         console.error('Error sending milestone:', error.message);
     }
 
-    // Send to FREE channel (delayed)
+    // Send to FREE channel (instant - no delay)
     if (FREE_CHANNEL_ID) {
-        setTimeout(async () => {
-            try {
-                const freeOptions = {
-                    parse_mode: 'Markdown',
-                    disable_web_page_preview: true
-                };
+        try {
+            const freeOptions = {
+                parse_mode: 'HTML',
+                disable_web_page_preview: true
+            };
 
-                // Reply to original FREE call message if we have freeMessageId
-                if (data.freeMessageId) {
-                    console.log(`   📎 FREE Replying to message ID: ${data.freeMessageId}`);
-                    freeOptions.reply_parameters = {
-                        message_id: data.freeMessageId,
-                        allow_sending_without_reply: true
-                    };
-                }
-
-                await bot.telegram.sendMessage(FREE_CHANNEL_ID, message, freeOptions);
-                console.log(`📢 FREE milestone sent: ${data.symbol} ${milestone}x (delayed)`);
-            } catch (error) {
-                console.error('Error sending FREE milestone:', error.message);
+            // Reply to original FREE call message if we have freeMessageId
+            if (data.freeMessageId) {
+                console.log(`   📎 FREE Replying to message ID: ${data.freeMessageId}`);
+                freeOptions.reply_to_message_id = data.freeMessageId;
             }
-        }, FREE_DELAY_MS);
+
+            await bot.telegram.sendMessage(FREE_CHANNEL_ID, message, freeOptions);
+            console.log(`📢 FREE milestone sent: ${data.symbol} ${milestone}x`);
+        } catch (error) {
+            console.error('Error sending FREE milestone:', error.message);
+        }
     }
 }
 
