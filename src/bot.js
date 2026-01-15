@@ -1145,17 +1145,15 @@ tracker.on('newMigration', async (token) => {
         setTimeout(() => recentlyCalled.delete(token.address), 5 * 60 * 1000);
     }
 
-    // Send to FREE channel (delayed)
+    // Send to FREE channel (instant - no delay)
     if (FREE_CHANNEL_ID) {
-        setTimeout(async () => {
-            const freeMessageId = await sendCallToChannel(FREE_CHANNEL_ID, message, imageBuffer, 'FREE');
+        const freeMessageId = await sendCallToChannel(FREE_CHANNEL_ID, message, imageBuffer, 'FREE');
 
-            // Update tracked token with FREE message ID for milestone replies
-            if (freeMessageId && trackedTokens.has(token.address)) {
-                trackedTokens.get(token.address).freeMessageId = freeMessageId;
-                console.log(`   📌 FREE message ID stored for ${token.symbol}`);
-            }
-        }, FREE_DELAY_MS);
+        // Update tracked token with FREE message ID for milestone replies
+        if (freeMessageId && trackedTokens.has(token.address)) {
+            trackedTokens.get(token.address).freeMessageId = freeMessageId;
+            console.log(`   📌 FREE message ID stored for ${token.symbol}`);
+        }
     }
 
     // Track token for milestones (initially without FREE message ID)
