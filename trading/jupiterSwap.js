@@ -1,6 +1,10 @@
 const { Connection, VersionedTransaction, PublicKey, Keypair } = require('@solana/web3.js');
 const fetch = require('cross-fetch');
 const bs58 = require('bs58').default;
+const path = require('path');
+
+// Load .env from project root
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
 
 // Load from environment - Helius RPC for better performance
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY || '5c70b747-7e24-415b-8b87-697caaad0360';
