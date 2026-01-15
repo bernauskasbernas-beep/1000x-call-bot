@@ -1330,7 +1330,7 @@ async function start() {
 
     console.log(`📢 PAID channel: ${CHANNEL_ID} (instant)`);
     if (FREE_CHANNEL_ID) {
-        console.log(`📢 FREE channel: ${FREE_CHANNEL_ID} (${FREE_DELAY_MS / 1000}s delay)`);
+        console.log(`📢 FREE channel: ${FREE_CHANNEL_ID} (instant)`);
     }
 
     // Launch bot (will retry via unhandledRejection handler if 409)
