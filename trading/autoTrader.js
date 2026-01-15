@@ -3,150 +3,220 @@ const path = require('path');
 const fs = require('fs');
 
 const TRADING_USERS_FILE = path.join(__dirname, '../data/trading_users.json');
+const USER_WALLETS_FILE = path.join(__dirname, '../data/user_wallets.json');
 
-// ⚠️ REAL TRADING MODE - Set to false to use real SOL
-const DRY_RUN_MODE = false;
+// Owner Telegram ID - only owner can use auto trading for now
+const OWNER_ID = '1967466851';
 
 // Safety limits
-const MIN_WALLET_BALANCE = 0.05; // Keep at least 0.05 SOL for fees
+const MIN_WALLET_BALANCE = 0.01; // Keep at least 0.01 SOL for fees
+
+// ==================== DATA MANAGEMENT ====================
 
 function loadTradingUsers() {
     if (!fs.existsSync(TRADING_USERS_FILE)) {
         return {};
     }
-    const data = fs.readFileSync(TRADING_USERS_FILE, 'utf8');
-    return JSON.parse(data);
+    try {
+        const data = fs.readFileSync(TRADING_USERS_FILE, 'utf8');
+        return JSON.parse(data);
+    } catch (error) {
+        console.error('[AUTO-TRADER] Error loading trading users:', error.message);
+        return {};
+    }
 }
 
 function saveTradingUsers(users) {
-    fs.writeFileSync(TRADING_USERS_FILE, JSON.stringify(users, null, 2));
+    try {
+        // Ensure data directory exists
+        const dataDir = path.dirname(TRADING_USERS_FILE);
+        if (!fs.existsSync(dataDir)) {
+            fs.mkdirSync(dataDir, { recursive: true });
+        }
+        fs.writeFileSync(TRADING_USERS_FILE, JSON.stringify(users, null, 2));
+    } catch (error) {
+        console.error('[AUTO-TRADER] Error saving trading users:', error.message);
+    }
 }
 
-// Simulated buy function for dry-run mode
-async function simulateBuy(tokenAddress, solAmount) {
-    console.log('[DRY-RUN] Simulating buy...');
-    await new Promise(resolve => setTimeout(resolve, 1000));
+function loadUserWallets() {
+    if (!fs.existsSync(USER_WALLETS_FILE)) {
+        return {};
+    }
+    try {
+        const data = fs.readFileSync(USER_WALLETS_FILE, 'utf8');
+        return JSON.parse(data);
+    } catch (error) {
+        console.error('[AUTO-TRADER] Error loading user wallets:', error.message);
+        return {};
+    }
+}
 
-    const fakeTokensReceived = Math.floor(Math.random() * 1000000000) + 100000000;
-    const fakeTxSignature = 'DRY_RUN_' + Date.now() + '_' + Math.random().toString(36).substring(7);
+function saveUserWallets(wallets) {
+    try {
+        const dataDir = path.dirname(USER_WALLETS_FILE);
+        if (!fs.existsSync(dataDir)) {
+            fs.mkdirSync(dataDir, { recursive: true });
+        }
+        fs.writeFileSync(USER_WALLETS_FILE, JSON.stringify(wallets, null, 2));
+    } catch (error) {
+        console.error('[AUTO-TRADER] Error saving user wallets:', error.message);
+    }
+}
 
-    return {
-        success: true,
-        signature: fakeTxSignature,
-        tokensReceived: fakeTokensReceived,
-        solSpent: solAmount,
-        txUrl: 'https://solscan.io/tx/' + fakeTxSignature
+// Get or create user trading profile
+function getUserProfile(userId) {
+    const users = loadTradingUsers();
+    if (!users[userId]) {
+        users[userId] = {
+            tradingEnabled: false,
+            positions: [],
+            history: [],
+            settings: {
+                tradeSize: 0.05,        // Default 0.05 SOL per trade
+                maxPositions: 3,         // Max 3 positions at once
+                takeProfitMultiplier: 2.0,  // Sell at 2x
+                stopLossMultiplier: 0.5     // Sell at -50%
+            }
+        };
+        saveTradingUsers(users);
+    }
+    return users[userId];
+}
+
+// Update user profile
+function updateUserProfile(userId, updates) {
+    const users = loadTradingUsers();
+    if (!users[userId]) {
+        users[userId] = getUserProfile(userId);
+    }
+    Object.assign(users[userId], updates);
+    saveTradingUsers(users);
+    return users[userId];
+}
+
+// Update user settings
+function updateUserSettings(userId, settingKey, value) {
+    const users = loadTradingUsers();
+    if (!users[userId]) {
+        users[userId] = getUserProfile(userId);
+    }
+    users[userId].settings[settingKey] = value;
+    saveTradingUsers(users);
+    return users[userId];
+}
+
+// Get user wallet
+function getUserWallet(userId) {
+    const wallets = loadUserWallets();
+    return wallets[userId] || null;
+}
+
+// Save user wallet (encrypted private key would be better in production)
+function saveUserWallet(userId, privateKey) {
+    const wallets = loadUserWallets();
+    wallets[userId] = {
+        privateKey: privateKey,
+        addedAt: Date.now()
     };
+    saveUserWallets(wallets);
 }
 
-// Simulated sell function for dry-run mode
-async function simulateSell(tokenAddress, tokenAmount, buyMC, currentMC) {
-    console.log('[DRY-RUN] Simulating sell...');
-    await new Promise(resolve => setTimeout(resolve, 1000));
-
-    const multiplier = currentMC / buyMC;
-    const fakeTxSignature = 'DRY_RUN_' + Date.now() + '_' + Math.random().toString(36).substring(7);
-
-    return {
-        success: true,
-        signature: fakeTxSignature,
-        solReceived: 0,
-        txUrl: 'https://solscan.io/tx/' + fakeTxSignature
-    };
+// Remove user wallet
+function removeUserWallet(userId) {
+    const wallets = loadUserWallets();
+    delete wallets[userId];
+    saveUserWallets(wallets);
 }
+
+// ==================== TRADING FUNCTIONS ====================
 
 async function handleNewMigration(token, bot) {
-    console.log('[AUTO-TRADER] New call detected:', token.symbol, 'MC:', token.marketCap);
+    console.log('[AUTO-TRADER] New call detected:', token.symbol, 'MC:', Math.round(token.marketCap));
 
     const users = loadTradingUsers();
 
     for (const [userId, user] of Object.entries(users)) {
+        // Skip if trading disabled
         if (!user.tradingEnabled) {
-            console.log('[AUTO-TRADER] User', userId, 'has trading disabled');
             continue;
         }
 
-        if (user.balance < user.settings.tradeSize) {
-            console.log('[AUTO-TRADER] User', userId, 'insufficient balance:', user.balance, 'SOL');
+        // Check if user has wallet configured
+        const userWallet = getUserWallet(userId);
+        if (!userWallet && userId !== OWNER_ID) {
+            console.log('[AUTO-TRADER] User', userId, 'has no wallet configured');
             continue;
         }
 
-        if (user.positions.length >= user.settings.maxPositions) {
+        // Check max positions
+        if (user.positions && user.positions.length >= user.settings.maxPositions) {
             console.log('[AUTO-TRADER] User', userId, 'max positions reached:', user.positions.length);
             continue;
         }
 
-        // Check real wallet balance before trading
-        if (!DRY_RUN_MODE) {
-            try {
-                const walletBalance = await jupiterSwap.getWalletBalance();
-                const requiredBalance = user.settings.tradeSize + MIN_WALLET_BALANCE;
+        // Check wallet balance
+        try {
+            const walletBalance = await jupiterSwap.getWalletBalance();
+            const requiredBalance = user.settings.tradeSize + MIN_WALLET_BALANCE;
 
-                if (walletBalance < requiredBalance) {
-                    console.log('[AUTO-TRADER] Wallet balance too low:', walletBalance, 'SOL (need', requiredBalance, 'SOL)');
+            if (walletBalance < requiredBalance) {
+                console.log('[AUTO-TRADER] Low balance:', walletBalance.toFixed(4), 'SOL (need', requiredBalance.toFixed(4), 'SOL)');
 
-                    // Notify user
-                    bot.telegram.sendMessage(userId,
-                        '⚠️ <b>LOW WALLET BALANCE</b>\n\n' +
-                        'Wallet: ' + walletBalance.toFixed(4) + ' SOL\n' +
-                        'Need: ' + requiredBalance.toFixed(4) + ' SOL\n\n' +
-                        'Please add more SOL to continue trading.',
-                        { parse_mode: 'HTML' }
-                    ).catch(err => console.error('Notify error:', err.message));
-
-                    continue;
-                }
-            } catch (error) {
-                console.error('[AUTO-TRADER] Error checking wallet balance:', error.message);
+                bot.telegram.sendMessage(userId,
+                    '⚠️ <b>LOW WALLET BALANCE</b>\n\n' +
+                    '💰 Wallet: ' + walletBalance.toFixed(4) + ' SOL\n' +
+                    '📊 Need: ' + requiredBalance.toFixed(4) + ' SOL\n\n' +
+                    'Add more SOL to continue auto-trading.',
+                    { parse_mode: 'HTML' }
+                ).catch(err => console.error('Notify error:', err.message));
                 continue;
             }
+        } catch (error) {
+            console.error('[AUTO-TRADER] Error checking balance:', error.message);
+            continue;
         }
 
-        console.log('[AUTO-TRADER] Buying', token.symbol, 'for user', userId, DRY_RUN_MODE ? '(DRY-RUN)' : '(REAL)');
+        // Execute buy
+        console.log('[AUTO-TRADER] Buying', token.symbol, 'for user', userId);
 
         try {
-            let buyResult;
-
-            if (DRY_RUN_MODE) {
-                buyResult = await simulateBuy(token.address, user.settings.tradeSize);
-            } else {
-                buyResult = await jupiterSwap.buyToken(userId, token.address, user.settings.tradeSize);
-            }
+            const buyResult = await jupiterSwap.buyToken(userId, token.address, user.settings.tradeSize);
 
             if (buyResult.success) {
-                user.balance -= user.settings.tradeSize;
-
+                // Add position
                 if (!user.positions) user.positions = [];
                 user.positions.push({
                     tokenAddress: token.address,
                     symbol: token.symbol,
+                    name: token.name,
                     buyMC: token.marketCap,
                     buyPrice: token.price || 0,
                     tokensOwned: buyResult.tokensReceived,
                     solSpent: user.settings.tradeSize,
                     boughtAt: Date.now(),
-                    signature: buyResult.signature,
-                    dryRun: DRY_RUN_MODE
+                    signature: buyResult.signature
                 });
 
                 saveTradingUsers(users);
 
-                console.log('[AUTO-TRADER] Buy SUCCESS for user', userId);
+                console.log('[AUTO-TRADER] BUY SUCCESS:', token.symbol);
 
-                const modeLabel = DRY_RUN_MODE ? '[TEST] ' : '';
-                const msg = modeLabel + '✅ <b>AUTO-BUY</b>\n\n' +
-                    '🪙 Token: ' + token.symbol + '\n' +
+                const msg = '✅ <b>AUTO-BUY EXECUTED</b>\n\n' +
+                    '🪙 Token: <b>' + token.symbol + '</b>\n' +
                     '💰 Spent: ' + user.settings.tradeSize + ' SOL\n' +
-                    '📊 Buy MC: $' + Math.round(token.marketCap) + '\n' +
-                    '💼 Balance: ' + user.balance.toFixed(3) + ' SOL\n' +
+                    '📊 Buy MC: $' + formatNumber(token.marketCap) + '\n' +
                     '📈 Positions: ' + user.positions.length + '/' + user.settings.maxPositions + '\n\n' +
-                    '🔗 TX: ' + buyResult.txUrl;
+                    '🎯 TP: ' + user.settings.takeProfitMultiplier + 'x | SL: ' + (user.settings.stopLossMultiplier * 100) + '%\n\n' +
+                    '🔗 <a href="' + buyResult.txUrl + '">View Transaction</a>';
 
-                bot.telegram.sendMessage(userId, msg, { parse_mode: 'HTML' }).catch(err => {
-                    console.error('Notify error:', err.message);
-                });
+                bot.telegram.sendMessage(userId, msg, {
+                    parse_mode: 'HTML',
+                    disable_web_page_preview: true
+                }).catch(err => console.error('Notify error:', err.message));
+
             } else {
-                console.error('[AUTO-TRADER] Buy FAILED for user', userId, ':', buyResult.error);
+                console.error('[AUTO-TRADER] BUY FAILED:', buyResult.error);
 
                 bot.telegram.sendMessage(userId,
                     '❌ <b>AUTO-BUY FAILED</b>\n\n' +
@@ -161,6 +231,88 @@ async function handleNewMigration(token, bot) {
     }
 }
 
+// Manual buy function
+async function manualBuy(userId, tokenAddress, solAmount, bot) {
+    const user = getUserProfile(userId);
+
+    try {
+        const walletBalance = await jupiterSwap.getWalletBalance();
+        if (walletBalance < solAmount + MIN_WALLET_BALANCE) {
+            return { success: false, error: 'Insufficient balance: ' + walletBalance.toFixed(4) + ' SOL' };
+        }
+
+        const buyResult = await jupiterSwap.buyToken(userId, tokenAddress, solAmount);
+
+        if (buyResult.success) {
+            // Add to positions
+            const users = loadTradingUsers();
+            if (!users[userId]) users[userId] = user;
+            if (!users[userId].positions) users[userId].positions = [];
+
+            users[userId].positions.push({
+                tokenAddress: tokenAddress,
+                symbol: 'MANUAL',
+                name: 'Manual Buy',
+                buyMC: 0,
+                buyPrice: 0,
+                tokensOwned: buyResult.tokensReceived,
+                solSpent: solAmount,
+                boughtAt: Date.now(),
+                signature: buyResult.signature,
+                manual: true
+            });
+
+            saveTradingUsers(users);
+        }
+
+        return buyResult;
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+}
+
+// Manual sell function
+async function manualSell(userId, tokenAddress, bot) {
+    const users = loadTradingUsers();
+    const user = users[userId];
+
+    if (!user || !user.positions) {
+        return { success: false, error: 'No positions found' };
+    }
+
+    const positionIndex = user.positions.findIndex(p => p.tokenAddress === tokenAddress);
+    if (positionIndex === -1) {
+        return { success: false, error: 'Position not found' };
+    }
+
+    const position = user.positions[positionIndex];
+
+    try {
+        const sellResult = await jupiterSwap.sellToken(userId, tokenAddress, position.tokensOwned);
+
+        if (sellResult.success) {
+            // Remove position and add to history
+            user.positions.splice(positionIndex, 1);
+
+            if (!user.history) user.history = [];
+            user.history.push({
+                ...position,
+                soldAt: Date.now(),
+                sellSignature: sellResult.signature,
+                solReceived: sellResult.solReceived / 1e9,
+                reason: 'MANUAL'
+            });
+
+            saveTradingUsers(users);
+        }
+
+        return sellResult;
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+}
+
+// Get current market cap
 async function getCurrentMC(tokenAddress) {
     try {
         const fetch = require('cross-fetch');
@@ -168,117 +320,108 @@ async function getCurrentMC(tokenAddress) {
         const data = await response.json();
 
         if (data.pairs && data.pairs.length > 0) {
-            const pair = data.pairs[0];
-            return pair.fdv || pair.marketCap || 0;
+            return data.pairs[0].fdv || data.pairs[0].marketCap || 0;
         }
-
         return 0;
     } catch (error) {
-        console.error('[AUTO-TRADER] Error fetching MC:', error.message);
         return 0;
     }
 }
 
+// Monitor positions for TP/SL
 async function monitorPositions(bot) {
-    console.log('[DEBUG] monitorPositions called');
     const users = loadTradingUsers();
 
     for (const [userId, user] of Object.entries(users)) {
         if (!user.positions || user.positions.length === 0) continue;
+        if (!user.tradingEnabled) continue;
 
         for (let i = user.positions.length - 1; i >= 0; i--) {
             const position = user.positions[i];
 
             try {
                 const currentMC = await getCurrentMC(position.tokenAddress);
-
-                if (currentMC === 0) {
-                    console.log('[MONITOR] Could not fetch MC for', position.symbol);
-                    continue;
-                }
+                if (currentMC === 0 || position.buyMC === 0) continue;
 
                 const multiplier = currentMC / position.buyMC;
-
-                console.log('[MONITOR]', position.symbol, ':', multiplier.toFixed(2) + 'x', '(MC:', Math.round(currentMC) + ')');
 
                 const shouldSellProfit = multiplier >= user.settings.takeProfitMultiplier;
                 const shouldSellLoss = multiplier <= user.settings.stopLossMultiplier;
 
                 if (shouldSellProfit || shouldSellLoss) {
-                    const reason = shouldSellProfit ? 'TAKE PROFIT (' + multiplier.toFixed(2) + 'x)' : 'STOP LOSS (' + multiplier.toFixed(2) + 'x)';
-                    console.log('[MONITOR] Selling', position.symbol, 'for user', userId, '-', reason);
+                    const reason = shouldSellProfit ? 'TAKE PROFIT' : 'STOP LOSS';
+                    console.log('[AUTO-TRADER] Selling', position.symbol, '-', reason, '(' + multiplier.toFixed(2) + 'x)');
 
-                    let sellResult;
-                    const isDryRun = DRY_RUN_MODE || position.dryRun;
-
-                    if (isDryRun) {
-                        sellResult = await simulateSell(position.tokenAddress, position.tokensOwned, position.buyMC, currentMC);
-                        sellResult.solReceived = Math.floor(position.solSpent * multiplier * 1e9);
-                    } else {
-                        sellResult = await jupiterSwap.sellToken(userId, position.tokenAddress, position.tokensOwned);
-                    }
+                    const sellResult = await jupiterSwap.sellToken(userId, position.tokenAddress, position.tokensOwned);
 
                     if (sellResult.success) {
                         const solReceived = sellResult.solReceived / 1e9;
                         const pnl = solReceived - position.solSpent;
 
-                        user.balance += solReceived;
+                        // Move to history
                         user.positions.splice(i, 1);
-
                         if (!user.history) user.history = [];
                         user.history.push({
-                            symbol: position.symbol,
-                            buyMC: position.buyMC,
+                            ...position,
                             sellMC: currentMC,
                             multiplier: multiplier,
-                            solSpent: position.solSpent,
                             solReceived: solReceived,
                             pnl: pnl,
                             soldAt: Date.now(),
-                            signature: sellResult.signature,
-                            reason: reason,
-                            dryRun: isDryRun
+                            sellSignature: sellResult.signature,
+                            reason: reason
                         });
 
                         saveTradingUsers(users);
 
                         const emoji = pnl > 0 ? '🚀' : '📉';
-                        const pnlText = pnl > 0 ? '+' + pnl.toFixed(3) : pnl.toFixed(3);
-                        const modeLabel = isDryRun ? '[TEST] ' : '';
+                        const pnlText = pnl > 0 ? '+' + pnl.toFixed(4) : pnl.toFixed(4);
 
-                        const msg = modeLabel + '💰 <b>AUTO-SELL</b>\n\n' +
-                            '🪙 Token: ' + position.symbol + '\n' +
-                            '📊 Exit: ' + multiplier.toFixed(2) + 'x ' + emoji + '\n' +
+                        const msg = emoji + ' <b>AUTO-SELL: ' + reason + '</b>\n\n' +
+                            '🪙 Token: <b>' + position.symbol + '</b>\n' +
+                            '📊 Exit: ' + multiplier.toFixed(2) + 'x\n' +
                             '💵 P&L: ' + pnlText + ' SOL\n' +
-                            '💼 Balance: ' + user.balance.toFixed(3) + ' SOL\n' +
                             '📈 Positions: ' + user.positions.length + '/' + user.settings.maxPositions + '\n\n' +
-                            '🔗 TX: ' + sellResult.txUrl;
+                            '🔗 <a href="' + sellResult.txUrl + '">View Transaction</a>';
 
-                        bot.telegram.sendMessage(userId, msg, { parse_mode: 'HTML' }).catch(err => {
-                            console.error('Notify error:', err.message);
-                        });
-                    } else {
-                        console.error('[MONITOR] Sell FAILED for', position.symbol, ':', sellResult.error);
+                        bot.telegram.sendMessage(userId, msg, {
+                            parse_mode: 'HTML',
+                            disable_web_page_preview: true
+                        }).catch(err => console.error('Notify error:', err.message));
                     }
                 }
-
             } catch (error) {
-                console.error('[MONITOR] Error monitoring position', position.symbol, ':', error.message);
+                console.error('[AUTO-TRADER] Monitor error:', error.message);
             }
         }
     }
 }
 
 function startPositionMonitoring(bot) {
-    const mode = DRY_RUN_MODE ? '[DRY-RUN MODE]' : '[REAL TRADING MODE]';
-    console.log('[AUTO-TRADER] Starting position monitoring (every 30s)', mode);
+    console.log('[AUTO-TRADER] Starting position monitoring (every 30s)');
+    setInterval(() => monitorPositions(bot), 30000);
+}
 
-    setInterval(async () => {
-        await monitorPositions(bot);
-    }, 30000);
+// Format number helper
+function formatNumber(num) {
+    if (!num) return '0';
+    if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return num.toFixed(0);
 }
 
 module.exports = {
     handleNewMigration,
-    startPositionMonitoring
+    startPositionMonitoring,
+    getUserProfile,
+    updateUserProfile,
+    updateUserSettings,
+    getUserWallet,
+    saveUserWallet,
+    removeUserWallet,
+    manualBuy,
+    manualSell,
+    loadTradingUsers,
+    saveTradingUsers,
+    OWNER_ID
 };

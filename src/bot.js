@@ -375,6 +375,9 @@ Choose an option below:
                 [
                     { text: '💬 Support', callback_data: 'menu_support' },
                     { text: '📢 Channels', callback_data: 'menu_channels' }
+                ],
+                [
+                    { text: '🤖 Auto Trading', callback_data: 'menu_trading' }
                 ]
             ]
         }
@@ -401,6 +404,9 @@ Choose an option:
                 [
                     { text: '💬 Support', callback_data: 'menu_support' },
                     { text: '📢 Channels', callback_data: 'menu_channels' }
+                ],
+                [
+                    { text: '🤖 Auto Trading', callback_data: 'menu_trading' }
                 ]
             ]
         }
@@ -584,7 +590,516 @@ Choose an option:
                 [
                     { text: '💬 Support', callback_data: 'menu_support' },
                     { text: '📢 Channels', callback_data: 'menu_channels' }
+                ],
+                [
+                    { text: '🤖 Auto Trading', callback_data: 'menu_trading' }
                 ]
+            ]
+        }
+    });
+});
+
+// ==================== AUTO TRADING MENU ====================
+
+const jupiterSwap = require('../trading/jupiterSwap');
+
+// Main trading menu
+bot.action('menu_trading', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const user = autoTrader.getUserProfile(userId);
+
+    const statusEmoji = user.tradingEnabled ? '🟢' : '🔴';
+    const statusText = user.tradingEnabled ? 'ENABLED' : 'DISABLED';
+
+    let balanceText = 'Not connected';
+    try {
+        const balance = await jupiterSwap.getWalletBalance();
+        balanceText = balance.toFixed(4) + ' SOL';
+    } catch (e) {
+        balanceText = 'Error';
+    }
+
+    await ctx.editMessageText(`
+🤖 *AUTO TRADING*
+
+${statusEmoji} Status: *${statusText}*
+💰 Wallet: ${balanceText}
+📊 Positions: ${user.positions?.length || 0}/${user.settings.maxPositions}
+
+*Current Settings:*
+💵 Trade Size: ${user.settings.tradeSize} SOL
+🎯 Take Profit: ${user.settings.takeProfitMultiplier}x
+🛑 Stop Loss: ${(user.settings.stopLossMultiplier * 100)}%
+
+_When enabled, bot will auto-buy every call and auto-sell at TP/SL._
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: user.tradingEnabled ? '🔴 Disable Trading' : '🟢 Enable Trading', callback_data: 'trading_toggle' }
+                ],
+                [
+                    { text: '⚙️ Settings', callback_data: 'trading_settings' },
+                    { text: '📊 Positions', callback_data: 'trading_positions' }
+                ],
+                [
+                    { text: '💼 Wallet', callback_data: 'trading_wallet' },
+                    { text: '📜 History', callback_data: 'trading_history' }
+                ],
+                [
+                    { text: '⬅️ Back to Menu', callback_data: 'menu_back' }
+                ]
+            ]
+        }
+    });
+});
+
+// Toggle trading on/off
+bot.action('trading_toggle', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const user = autoTrader.getUserProfile(userId);
+
+    const newStatus = !user.tradingEnabled;
+    autoTrader.updateUserProfile(userId, { tradingEnabled: newStatus });
+
+    const emoji = newStatus ? '🟢' : '🔴';
+    const text = newStatus ? 'ENABLED' : 'DISABLED';
+
+    await ctx.editMessageText(`
+${emoji} *Auto Trading ${text}*
+
+${newStatus ? 'Bot will now automatically buy every call and sell at your TP/SL settings.' : 'Auto trading is now disabled. Bot will not make any trades.'}
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]
+            ]
+        }
+    });
+});
+
+// Trading settings menu
+bot.action('trading_settings', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const user = autoTrader.getUserProfile(userId);
+
+    await ctx.editMessageText(`
+⚙️ *TRADING SETTINGS*
+
+💵 *Trade Size:* ${user.settings.tradeSize} SOL
+🎯 *Take Profit:* ${user.settings.takeProfitMultiplier}x
+🛑 *Stop Loss:* ${(user.settings.stopLossMultiplier * 100)}%
+📊 *Max Positions:* ${user.settings.maxPositions}
+
+_Tap a button to change setting:_
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '💵 Trade Size', callback_data: 'set_tradesize' }
+                ],
+                [
+                    { text: '🎯 Take Profit', callback_data: 'set_takeprofit' }
+                ],
+                [
+                    { text: '🛑 Stop Loss', callback_data: 'set_stoploss' }
+                ],
+                [
+                    { text: '📊 Max Positions', callback_data: 'set_maxpos' }
+                ],
+                [
+                    { text: '⬅️ Back to Trading', callback_data: 'menu_trading' }
+                ]
+            ]
+        }
+    });
+});
+
+// Trade size options
+bot.action('set_tradesize', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+💵 *SET TRADE SIZE*
+
+Select how much SOL to spend per trade:
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '0.01 SOL', callback_data: 'tradesize_0.01' },
+                    { text: '0.02 SOL', callback_data: 'tradesize_0.02' },
+                    { text: '0.05 SOL', callback_data: 'tradesize_0.05' }
+                ],
+                [
+                    { text: '0.1 SOL', callback_data: 'tradesize_0.1' },
+                    { text: '0.2 SOL', callback_data: 'tradesize_0.2' },
+                    { text: '0.5 SOL', callback_data: 'tradesize_0.5' }
+                ],
+                [
+                    { text: '1 SOL', callback_data: 'tradesize_1' },
+                    { text: '2 SOL', callback_data: 'tradesize_2' }
+                ],
+                [
+                    { text: '⬅️ Back', callback_data: 'trading_settings' }
+                ]
+            ]
+        }
+    });
+});
+
+// Handle trade size selection
+bot.action(/tradesize_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const size = parseFloat(ctx.match[1]);
+
+    autoTrader.updateUserSettings(userId, 'tradeSize', size);
+
+    await ctx.editMessageText(`
+✅ *Trade Size Updated*
+
+New trade size: *${size} SOL*
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Settings', callback_data: 'trading_settings' }]
+            ]
+        }
+    });
+});
+
+// Take profit options
+bot.action('set_takeprofit', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+🎯 *SET TAKE PROFIT*
+
+Sell automatically when token reaches:
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '1.5x', callback_data: 'tp_1.5' },
+                    { text: '2x', callback_data: 'tp_2' },
+                    { text: '3x', callback_data: 'tp_3' }
+                ],
+                [
+                    { text: '5x', callback_data: 'tp_5' },
+                    { text: '10x', callback_data: 'tp_10' },
+                    { text: '20x', callback_data: 'tp_20' }
+                ],
+                [
+                    { text: '⬅️ Back', callback_data: 'trading_settings' }
+                ]
+            ]
+        }
+    });
+});
+
+bot.action(/tp_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const tp = parseFloat(ctx.match[1]);
+
+    autoTrader.updateUserSettings(userId, 'takeProfitMultiplier', tp);
+
+    await ctx.editMessageText(`
+✅ *Take Profit Updated*
+
+New TP: *${tp}x*
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Settings', callback_data: 'trading_settings' }]
+            ]
+        }
+    });
+});
+
+// Stop loss options
+bot.action('set_stoploss', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+🛑 *SET STOP LOSS*
+
+Sell automatically when token drops to:
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '-20%', callback_data: 'sl_0.8' },
+                    { text: '-30%', callback_data: 'sl_0.7' },
+                    { text: '-40%', callback_data: 'sl_0.6' }
+                ],
+                [
+                    { text: '-50%', callback_data: 'sl_0.5' },
+                    { text: '-60%', callback_data: 'sl_0.4' },
+                    { text: '-70%', callback_data: 'sl_0.3' }
+                ],
+                [
+                    { text: '⬅️ Back', callback_data: 'trading_settings' }
+                ]
+            ]
+        }
+    });
+});
+
+bot.action(/sl_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const sl = parseFloat(ctx.match[1]);
+
+    autoTrader.updateUserSettings(userId, 'stopLossMultiplier', sl);
+
+    await ctx.editMessageText(`
+✅ *Stop Loss Updated*
+
+New SL: *-${((1 - sl) * 100).toFixed(0)}%*
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Settings', callback_data: 'trading_settings' }]
+            ]
+        }
+    });
+});
+
+// Max positions options
+bot.action('set_maxpos', async (ctx) => {
+    await ctx.answerCbQuery();
+    await ctx.editMessageText(`
+📊 *SET MAX POSITIONS*
+
+Maximum open positions at once:
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [
+                    { text: '1', callback_data: 'maxpos_1' },
+                    { text: '2', callback_data: 'maxpos_2' },
+                    { text: '3', callback_data: 'maxpos_3' }
+                ],
+                [
+                    { text: '5', callback_data: 'maxpos_5' },
+                    { text: '10', callback_data: 'maxpos_10' }
+                ],
+                [
+                    { text: '⬅️ Back', callback_data: 'trading_settings' }
+                ]
+            ]
+        }
+    });
+});
+
+bot.action(/maxpos_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const max = parseInt(ctx.match[1]);
+
+    autoTrader.updateUserSettings(userId, 'maxPositions', max);
+
+    await ctx.editMessageText(`
+✅ *Max Positions Updated*
+
+New max: *${max} positions*
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Settings', callback_data: 'trading_settings' }]
+            ]
+        }
+    });
+});
+
+// Positions view
+bot.action('trading_positions', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const user = autoTrader.getUserProfile(userId);
+
+    if (!user.positions || user.positions.length === 0) {
+        await ctx.editMessageText(`
+📊 *OPEN POSITIONS*
+
+No open positions.
+
+_When auto trading is enabled, bought tokens will appear here._
+        `, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]
+                ]
+            }
+        });
+        return;
+    }
+
+    let posText = '';
+    const buttons = [];
+
+    for (const pos of user.positions) {
+        const ageMin = Math.floor((Date.now() - pos.boughtAt) / 60000);
+        posText += `\n🪙 *${pos.symbol}*\n`;
+        posText += `   💰 ${pos.solSpent} SOL | ⏱️ ${ageMin}m ago\n`;
+
+        buttons.push([{ text: `🔴 Sell ${pos.symbol}`, callback_data: `sell_${pos.tokenAddress.substring(0, 20)}` }]);
+    }
+
+    buttons.push([{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]);
+
+    await ctx.editMessageText(`
+📊 *OPEN POSITIONS* (${user.positions.length}/${user.settings.maxPositions})
+${posText}
+_Tap to manually sell:_
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons }
+    });
+});
+
+// Manual sell
+bot.action(/sell_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery('Selling...');
+    const userId = ctx.from.id.toString();
+    const addressPrefix = ctx.match[1];
+
+    const user = autoTrader.getUserProfile(userId);
+    const position = user.positions?.find(p => p.tokenAddress.startsWith(addressPrefix));
+
+    if (!position) {
+        await ctx.editMessageText('❌ Position not found.', {
+            reply_markup: {
+                inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'trading_positions' }]]
+            }
+        });
+        return;
+    }
+
+    const result = await autoTrader.manualSell(userId, position.tokenAddress, bot);
+
+    if (result.success) {
+        await ctx.editMessageText(`
+✅ *SOLD ${position.symbol}*
+
+🔗 TX: ${result.txUrl}
+        `, {
+            parse_mode: 'Markdown',
+            disable_web_page_preview: true,
+            reply_markup: {
+                inline_keyboard: [[{ text: '⬅️ Back to Positions', callback_data: 'trading_positions' }]]
+            }
+        });
+    } else {
+        await ctx.editMessageText(`
+❌ *Sell Failed*
+
+Error: ${result.error}
+        `, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [[{ text: '⬅️ Back to Positions', callback_data: 'trading_positions' }]]
+            }
+        });
+    }
+});
+
+// Wallet info
+bot.action('trading_wallet', async (ctx) => {
+    await ctx.answerCbQuery();
+
+    let walletInfo = 'Not configured';
+    let balance = 'N/A';
+    let address = 'N/A';
+
+    try {
+        const keypair = jupiterSwap.getTradingKeypair();
+        address = keypair.publicKey.toString();
+        const bal = await jupiterSwap.getWalletBalance();
+        balance = bal.toFixed(4) + ' SOL';
+        walletInfo = 'Connected';
+    } catch (e) {
+        walletInfo = 'Error: ' + e.message;
+    }
+
+    await ctx.editMessageText(`
+💼 *TRADING WALLET*
+
+📊 Status: ${walletInfo}
+💰 Balance: ${balance}
+📍 Address:
+\`${address}\`
+
+_This wallet is used for auto trading._
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '🔄 Refresh Balance', callback_data: 'trading_wallet' }],
+                [{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]
+            ]
+        }
+    });
+});
+
+// Trading history
+bot.action('trading_history', async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const user = autoTrader.getUserProfile(userId);
+
+    if (!user.history || user.history.length === 0) {
+        await ctx.editMessageText(`
+📜 *TRADING HISTORY*
+
+No trades yet.
+        `, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]
+                ]
+            }
+        });
+        return;
+    }
+
+    // Show last 5 trades
+    const recent = user.history.slice(-5).reverse();
+    let histText = '';
+    let totalPnl = 0;
+
+    for (const trade of recent) {
+        const emoji = (trade.pnl || 0) > 0 ? '🟢' : '🔴';
+        const pnlText = trade.pnl ? (trade.pnl > 0 ? '+' : '') + trade.pnl.toFixed(4) : 'N/A';
+        histText += `${emoji} *${trade.symbol}* | ${trade.reason || 'MANUAL'}\n`;
+        histText += `   P&L: ${pnlText} SOL\n`;
+        totalPnl += trade.pnl || 0;
+    }
+
+    await ctx.editMessageText(`
+📜 *TRADING HISTORY* (Last 5)
+${histText}
+📊 *Total P&L:* ${totalPnl > 0 ? '+' : ''}${totalPnl.toFixed(4)} SOL
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '⬅️ Back to Trading', callback_data: 'menu_trading' }]
             ]
         }
     });
@@ -931,12 +1446,12 @@ tracker.on('newMigration', async (token) => {
 
     console.log(`📡 Scanning: ${token.name} (${token.symbol})`);
 
-    // AUTO TRADING - DISABLED
-    // try {
-    //     await autoTrader.handleNewMigration(token, bot);
-    // } catch (error) {
-    //     console.error('[AUTO-TRADER] Error:', error.message);
-    // }
+    // AUTO TRADING - Execute trades for users with trading enabled
+    try {
+        await autoTrader.handleNewMigration(token, bot);
+    } catch (error) {
+        console.error('[AUTO-TRADER] Error:', error.message);
+    }
 
     // Duplicate call prevention - skip if already called in last 5 minutes
     if (recentlyCalled.has(token.address)) {
