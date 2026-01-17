@@ -9,16 +9,26 @@ class PumpFunTracker extends EventEmitter {
         this.isTracking = false;
         this.ws = null;
         this.reconnectAttempts = 0;
-        this.maxReconnectAttempts = 10;
+        this.maxReconnectAttempts = 3; // Quick fallback to polling
+        this.pollInterval = null;
     }
 
     async startTracking() {
         if (this.isTracking) return;
         this.isTracking = true;
 
-        console.log('🔍 Starting Pump.fun WebSocket connection...');
+        console.log('🔍 Starting tracker...');
 
+        // Try WebSocket first
         this.connectWebSocket();
+
+        // Start polling as backup after 5 seconds if WebSocket fails
+        setTimeout(() => {
+            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                console.log('📡 WebSocket not connected, using DexScreener polling...');
+                this.startPolling();
+            }
+        }, 5000);
     }
 
     connectWebSocket() {
@@ -373,43 +383,60 @@ class PumpFunTracker extends EventEmitter {
         }
     }
 
-    // Fallback polling method
+    // DexScreener polling - primary method when WebSocket is down
     startPolling() {
-        console.log('📡 Starting polling fallback...');
+        if (this.pollInterval) return; // Already polling
+
+        console.log('📡 Starting DexScreener polling (every 10s)...');
+        console.log('👀 Looking for new Raydium pairs...');
 
         this.pollInterval = setInterval(async () => {
             await this.pollNewTokens();
-        }, 5000);
+        }, 10000); // Poll every 10 seconds
 
+        // First poll immediately
         this.pollNewTokens();
     }
 
     async pollNewTokens() {
         try {
-            // Use DexScreener latest pairs as fallback
+            // Use DexScreener latest pairs
             const response = await axios.get(
                 'https://api.dexscreener.com/latest/dex/pairs/solana',
-                { timeout: 10000 }
+                { timeout: 15000 }
             );
 
-            const pairs = response.data.pairs || [];
+            const pairs = response.data?.pairs || [];
             const now = Date.now();
-            const fiveMinAgo = now - 5 * 60 * 1000;
+            const tenMinAgo = now - 10 * 60 * 1000;
 
-            const newPairs = pairs.filter(p =>
-                p.pairCreatedAt > fiveMinAgo &&
-                !this.recentMigrations.has(p.baseToken?.address)
-            ).slice(0, 20);
+            // Filter: new pairs (< 10 min), on Raydium, not processed, has liquidity
+            const newPairs = pairs.filter(p => {
+                const isNew = p.pairCreatedAt > tenMinAgo;
+                const isRaydium = p.dexId === 'raydium';
+                const notProcessed = !this.recentMigrations.has(p.baseToken?.address);
+                const hasLiquidity = (p.liquidity?.usd || 0) >= 3000;
+                return isNew && isRaydium && notProcessed && hasLiquidity;
+            }).slice(0, 10);
+
+            if (newPairs.length > 0) {
+                console.log(`🔍 Found ${newPairs.length} new Raydium pairs`);
+            }
 
             for (const pair of newPairs) {
                 const address = pair.baseToken?.address;
-                if (address && !this.recentMigrations.has(address)) {
-                    this.recentMigrations.add(address);
+                if (!address || this.recentMigrations.has(address)) continue;
 
-                    const token = this.formatDexPair(pair);
-                    console.log(`🚀 New token (poll): ${token.name} (${token.symbol})`);
-                    this.emit('newMigration', token);
-                }
+                this.recentMigrations.add(address);
+
+                console.log(`🚀 NEW TOKEN: ${pair.baseToken?.symbol || 'Unknown'}`);
+                console.log(`   Address: ${address.slice(0, 8)}...`);
+                console.log(`   MC: $${Math.round(pair.fdv || pair.marketCap || 0)}`);
+                console.log(`   LP: $${Math.round(pair.liquidity?.usd || 0)}`);
+
+                // Format and emit with delay for data enrichment
+                const token = this.formatMigrationToken({ mint: address, pool: pair.pairAddress }, {});
+                this.emitWithDelay(address, token);
             }
 
             // Cleanup old entries
@@ -419,7 +446,11 @@ class PumpFunTracker extends EventEmitter {
             }
 
         } catch (error) {
-            console.log('Poll error:', error.message);
+            if (error.message.includes('429')) {
+                console.log('⚠️ Rate limited, waiting...');
+            } else {
+                console.log('Poll error:', error.message);
+            }
         }
     }
 
