@@ -5,6 +5,10 @@ const PumpFunTracker = require('./services/pumpfunTracker');
 const { formatCallMessage } = require('./utils/formatter');
 const autoTrader = require('../trading/autoTrader');
 
+// Subscription system
+const subscriptionManager = require('../subscription/subscriptionManager');
+const PaymentChecker = require('../subscription/paymentChecker');
+
 // Initialize bot
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const tracker = new PumpFunTracker();
@@ -440,6 +444,35 @@ We track Pump.fun token migrations to Raydium in real-time.
 
 bot.action('menu_vip', async (ctx) => {
     await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const plans = subscriptionManager.getPlans();
+
+    // Check if user already has active subscription
+    if (subscriptionManager.isSubscribed(userId)) {
+        const sub = subscriptionManager.getSubscriber(userId);
+        let expiryText = sub.isLifetime ? 'Never (Lifetime)' : new Date(sub.expiresAt).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+        await ctx.editMessageText(`
+💎 *VIP SUBSCRIPTION*
+
+✅ You are already a VIP member!
+
+📋 *Your Subscription:*
+• Plan: ${sub.planName}
+• Expires: ${expiryText}
+
+🔗 *VIP Channel Link:*
+${sub.inviteLink || 'Contact @imthebestever1 for access'}
+        `, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [
+                    [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
+                ]
+            }
+        });
+        return;
+    }
 
     await ctx.editMessageText(`
 💎 *VIP SUBSCRIPTION*
@@ -448,22 +481,196 @@ Get *INSTANT* access to all calls!
 Premium signals and early access.
 
 ━━━━━━━━━━━━━━━━━━━━
+💰 *PRICING:*
+━━━━━━━━━━━━━━━━━━━━
 
-📩 *Contact owner for VIP access:*
-👤 @imthebestever1
+📅 1 Month - ${plans['1month'].price} SOL
+📅 2 Months - ${plans['2months'].price} SOL
+📅 3 Months - ${plans['3months'].price} SOL
+👑 Lifetime - ${plans['lifetime'].price} SOL
 
 ━━━━━━━━━━━━━━━━━━━━
 
-✅ Fast response
-✅ Secure payment
+✅ Automatic payment verification
 ✅ Instant access after payment
+✅ Unique one-time invite link
+
+_Select a plan to continue:_
     `, {
         parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
-                [{ text: '📩 Contact Owner', url: 'https://t.me/imthebestever1' }],
+                [
+                    { text: '📅 1 Month', callback_data: 'vip_buy_1month' },
+                    { text: '📅 2 Months', callback_data: 'vip_buy_2months' }
+                ],
+                [
+                    { text: '📅 3 Months', callback_data: 'vip_buy_3months' },
+                    { text: '👑 Lifetime', callback_data: 'vip_buy_lifetime' }
+                ],
                 [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
             ]
+        }
+    });
+});
+
+// VIP purchase flow - plan selection
+bot.action(/vip_buy_(.+)/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = ctx.from.id.toString();
+    const username = ctx.from.username || ctx.from.first_name || 'Unknown';
+    const planId = ctx.match[1];
+
+    // Create pending payment
+    const payment = subscriptionManager.createPendingPayment(userId, username, planId);
+
+    if (!payment) {
+        await ctx.editMessageText('❌ Invalid plan selected.', {
+            reply_markup: {
+                inline_keyboard: [[{ text: '⬅️ Back', callback_data: 'menu_vip' }]]
+            }
+        });
+        return;
+    }
+
+    await ctx.editMessageText(`
+💎 *VIP SUBSCRIPTION - ${payment.planName}*
+
+━━━━━━━━━━━━━━━━━━━━
+📋 *ORDER DETAILS:*
+━━━━━━━━━━━━━━━━━━━━
+
+🆔 Order: \`${payment.orderId}\`
+📅 Plan: ${payment.planName}
+💰 Amount: *${payment.uniqueAmount.toFixed(6)} SOL*
+
+━━━━━━━━━━━━━━━━━━━━
+📤 *SEND PAYMENT TO:*
+━━━━━━━━━━━━━━━━━━━━
+
+\`${payment.wallet}\`
+
+⚠️ *IMPORTANT:*
+• Send *EXACTLY* ${payment.uniqueAmount.toFixed(6)} SOL
+• The unique amount helps identify your payment
+• Payment expires in 30 minutes
+
+━━━━━━━━━━━━━━━━━━━━
+
+After sending, click "✅ Check Payment" below.
+_Payment is auto-checked every 30 seconds._
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [
+                [{ text: '✅ Check Payment', callback_data: 'vip_check_payment' }],
+                [{ text: '❌ Cancel', callback_data: 'vip_cancel' }]
+            ]
+        }
+    });
+});
+
+// Check payment status
+bot.action('vip_check_payment', async (ctx) => {
+    await ctx.answerCbQuery('🔍 Checking payment...');
+    const userId = ctx.from.id.toString();
+
+    const payment = subscriptionManager.getPendingPayment(userId);
+
+    if (!payment) {
+        await ctx.editMessageText(`
+❌ *No Pending Payment*
+
+Your payment session has expired or was cancelled.
+Please start a new order.
+        `, {
+            parse_mode: 'Markdown',
+            reply_markup: {
+                inline_keyboard: [[{ text: '💎 Buy VIP', callback_data: 'menu_vip' }]]
+            }
+        });
+        return;
+    }
+
+    await ctx.editMessageText(`
+⏳ *CHECKING PAYMENT...*
+
+🆔 Order: \`${payment.orderId}\`
+💰 Looking for: ${payment.uniqueAmount.toFixed(6)} SOL
+
+_Please wait..._
+    `, { parse_mode: 'Markdown' });
+
+    // The actual payment checking is done by PaymentChecker automatically
+    // This just shows the user their pending payment status
+
+    setTimeout(async () => {
+        // Check if payment was confirmed while we waited
+        if (subscriptionManager.isSubscribed(userId)) {
+            const sub = subscriptionManager.getSubscriber(userId);
+            let expiryText = sub.isLifetime ? 'Never (Lifetime)' : new Date(sub.expiresAt).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' });
+
+            await ctx.editMessageText(`
+🎉 *PAYMENT CONFIRMED!*
+
+✅ Your VIP subscription is now active!
+
+📋 *Details:*
+• Plan: ${sub.planName}
+• Expires: ${expiryText}
+
+🔗 *Join VIP Channel:*
+${sub.inviteLink}
+
+⚠️ This link is unique to you and can only be used once!
+            `, {
+                parse_mode: 'Markdown',
+                disable_web_page_preview: true,
+                reply_markup: {
+                    inline_keyboard: [[{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]]
+                }
+            });
+        } else {
+            await ctx.editMessageText(`
+⏳ *PAYMENT NOT FOUND YET*
+
+🆔 Order: \`${payment.orderId}\`
+💰 Amount: ${payment.uniqueAmount.toFixed(6)} SOL
+📤 Wallet: \`${payment.wallet}\`
+
+_Make sure you sent the EXACT amount._
+_Payments are checked automatically every 30s._
+
+⏱️ Expires: ${Math.ceil((payment.expiresAt - Date.now()) / 60000)} minutes
+            `, {
+                parse_mode: 'Markdown',
+                reply_markup: {
+                    inline_keyboard: [
+                        [{ text: '🔄 Check Again', callback_data: 'vip_check_payment' }],
+                        [{ text: '❌ Cancel', callback_data: 'vip_cancel' }]
+                    ]
+                }
+            });
+        }
+    }, 3000);
+});
+
+// Cancel payment
+bot.action('vip_cancel', async (ctx) => {
+    await ctx.answerCbQuery('Payment cancelled');
+    const userId = ctx.from.id.toString();
+
+    subscriptionManager.cancelPendingPayment(userId);
+
+    await ctx.editMessageText(`
+❌ *Payment Cancelled*
+
+Your order has been cancelled.
+No payment was processed.
+    `, {
+        parse_mode: 'Markdown',
+        reply_markup: {
+            inline_keyboard: [[{ text: '💎 Buy VIP', callback_data: 'menu_vip' }]]
         }
     });
 });
@@ -1827,6 +2034,11 @@ async function start() {
 
     // Schedule daily stats at 15:00
     scheduleDailyStats();
+
+    // Start payment checker for automatic subscription verification
+    const paymentChecker = new PaymentChecker(bot);
+    paymentChecker.start();
+    console.log('✅ Payment checker started (checks every 30s)');
 
     console.log(`📢 PAID channel: ${CHANNEL_ID} (instant)`);
     if (FREE_CHANNEL_ID) {
