@@ -1911,67 +1911,68 @@ function update24hStats(milestone) {
     else if (milestone >= 2) daily24hStats.x2++;
 }
 
-// Send daily stats at 15:00
+// Send daily stats at 17:00
 async function sendDailyStats() {
-    const now = new Date();
-
     // Calculate totals from performanceHistory (last 24h)
     const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
-    let calls24h = 0;
-    let x2 = 0, x5 = 0, x10 = 0, x20 = 0, x30 = 0, x50 = 0, x100 = 0, x200 = 0;
-    let under2x = 0;
+    let totalTokens = 0;
+    let x2 = 0, x3_5 = 0, x5_10 = 0, x10_50 = 0, x50_100 = 0, x100plus = 0;
+    let losses = 0;
+    let totalROI = 0;
 
     for (const [, data] of performanceHistory) {
         if (data.calledAt >= oneDayAgo) {
-            calls24h++;
+            totalTokens++;
             const maxX = data.maxX || 1;
 
-            if (maxX >= 200) x200++;
-            else if (maxX >= 100) x100++;
-            else if (maxX >= 50) x50++;
-            else if (maxX >= 30) x30++;
-            else if (maxX >= 20) x20++;
-            else if (maxX >= 10) x10++;
-            else if (maxX >= 5) x5++;
+            // Calculate ROI for this token
+            if (maxX >= 2) {
+                // Gain: (multiplier - 1) * 100%
+                totalROI += (maxX - 1) * 100;
+            } else {
+                // Loss: -100% (assuming total loss if under 2x)
+                totalROI -= 100;
+                losses++;
+            }
+
+            // Categorize by multiplier
+            if (maxX >= 100) x100plus++;
+            else if (maxX >= 50) x50_100++;
+            else if (maxX >= 10) x10_50++;
+            else if (maxX >= 5) x5_10++;
+            else if (maxX >= 3) x3_5++;
             else if (maxX >= 2) x2++;
-            else under2x++;
         }
     }
 
-    const successCount = x2 + x5 + x10 + x20 + x30 + x50 + x100 + x200;
-    const successRate = calls24h > 0 ? ((successCount / calls24h) * 100).toFixed(1) : '0.0';
+    const winners = x2 + x3_5 + x5_10 + x10_50 + x50_100 + x100plus;
+    const winRate = totalTokens > 0 ? ((winners / totalTokens) * 100).toFixed(2) : '0.00';
+    const avgGains = totalTokens > 0 ? (totalROI / totalTokens).toFixed(2) : '0.00';
 
-    const statsMessage = `
-📊 *24H DAILY REPORT*
-━━━━━━━━━━━━━━━━━━━━
+    const statsMessage = `📊 *Trade Outcome Statistics (Last 24 Hours):*
 
-📅 *Date:* ${now.toLocaleDateString('en-GB')}
+🔍 *Total Tokens Found:* ${totalTokens}
 
-📞 *Total Calls:* ${calls24h}
+*Outcomes:*
+✅ 2x: ${x2} tokens
+✅ 3-5x: ${x3_5} tokens
+✅ 5-10x: ${x5_10} tokens
+✅ 10-50x: ${x10_50} tokens
+✅ 50-100x: ${x50_100} tokens
+✅ >100x: ${x100plus} tokens
+❌ loss: ${losses} tokens
 
-━━━━━━━━━━━━━━━━━━━━
-🎯 *PERFORMANCE*
-━━━━━━━━━━━━━━━━━━━━
+🔴 *Win Rate:* ${winRate}%
+_This shows the percentage of tokens that achieved at least 2x gains._
 
-👑 200x+: ${x200}
-💎 100x+: ${x100}
-🚀 50x+: ${x50}
-🔥 30x+: ${x30}
-⚡ 20x+: ${x20}
-✨ 10x+: ${x10}
-💰 5x+: ${x5}
-✅ 2x+: ${x2}
+📈 *Total ROI:* ${totalROI.toFixed(2)}%
+_The ROI % is calculated as the sum of all individual token ROIs. Losses are marked as -100%, and gains are calculated based on the multiplier (e.g., a 2x multiplier equals a 100% gain)._
 
-❌ *Under 2x:* ${under2x}
-
-━━━━━━━━━━━━━━━━━━━━
-📈 *Success Rate:* ${successRate}%
-_(2x or higher)_
-━━━━━━━━━━━━━━━━━━━━
+🔑 *Average Gains:* ${avgGains}%
+_Average gains are calculated as the Total ROI divided by the total number of tokens found._
 
 💎 Get VIP for instant calls!
-@callbot1000x
-    `;
+@callbot1000x`;
 
     try {
         // Send to PAID channel and pin
@@ -1994,17 +1995,17 @@ _(2x or higher)_
     }
 }
 
-// Check if it's 15:00 and send daily stats
+// Check if it's 17:00 and send daily stats
 function scheduleDailyStats() {
     setInterval(() => {
         const now = new Date();
-        // Check if it's 15:00 (3 PM) - checks every minute
-        if (now.getHours() === 15 && now.getMinutes() === 0) {
+        // Check if it's 17:00 (5 PM) - checks every minute
+        if (now.getHours() === 17 && now.getMinutes() === 0) {
             sendDailyStats();
         }
     }, 60000); // Check every minute
 
-    console.log('✅ Daily stats scheduled for 15:00');
+    console.log('✅ Daily stats scheduled for 17:00');
 }
 
 // ==================== START BOT ====================
