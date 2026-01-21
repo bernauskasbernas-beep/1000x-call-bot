@@ -678,32 +678,63 @@ No payment was processed.
 bot.action('menu_stats', async (ctx) => {
     await ctx.answerCbQuery();
 
-    let x2to5 = 0, x5to15 = 0, x15to50 = 0, x50plus = 0, under2x = 0;
+    // Calculate stats from performanceHistory (last 24h)
+    const oneDayAgo = Date.now() - (24 * 60 * 60 * 1000);
+    let totalTokens = 0;
+    let x2 = 0, x3_5 = 0, x5_10 = 0, x10_50 = 0, x50_100 = 0, x100plus = 0;
+    let losses = 0;
+    let totalROI = 0;
+
     for (const [, data] of performanceHistory) {
-        const maxX = data.maxX || 1;
-        if (maxX >= 50) x50plus++;
-        else if (maxX >= 15) x15to50++;
-        else if (maxX >= 5) x5to15++;
-        else if (maxX >= 2) x2to5++;
-        else under2x++;
+        if (data.calledAt >= oneDayAgo) {
+            totalTokens++;
+            const maxX = data.maxX || 1;
+
+            // Calculate ROI for this token
+            if (maxX >= 2) {
+                totalROI += (maxX - 1) * 100;
+            } else {
+                totalROI -= 100;
+                losses++;
+            }
+
+            // Categorize by multiplier
+            if (maxX >= 100) x100plus++;
+            else if (maxX >= 50) x50_100++;
+            else if (maxX >= 10) x10_50++;
+            else if (maxX >= 5) x5_10++;
+            else if (maxX >= 3) x3_5++;
+            else if (maxX >= 2) x2++;
+        }
     }
-    const totalCalls = performanceHistory.size;
-    const pct = (n) => totalCalls > 0 ? ((n / totalCalls) * 100).toFixed(1) : '0.0';
 
-    await ctx.editMessageText(`
-📈 *BOT STATISTICS*
+    const winners = x2 + x3_5 + x5_10 + x10_50 + x50_100 + x100plus;
+    const winRate = totalTokens > 0 ? ((winners / totalTokens) * 100).toFixed(2) : '0.00';
+    const avgGains = totalTokens > 0 ? (totalROI / totalTokens).toFixed(2) : '0.00';
 
-🚀 *50x+:* ${x50plus} (${pct(x50plus)}%)
-🔥 *15x-50x:* ${x15to50} (${pct(x15to50)}%)
-💎 *5x-15x:* ${x5to15} (${pct(x5to15)}%)
-✅ *2x-5x:* ${x2to5} (${pct(x2to5)}%)
+    await ctx.editMessageText(`📊 *Trade Outcome Statistics (Last 24 Hours):*
 
-📞 *Total Calls:* ${totalCalls}
-📡 *Tracking:* ${trackedTokens.size} tokens
+🔍 *Total Tokens Found:* ${totalTokens}
+
+*Outcomes:*
+✅ 2x: ${x2} tokens
+✅ 3-5x: ${x3_5} tokens
+✅ 5-10x: ${x5_10} tokens
+✅ 10-50x: ${x10_50} tokens
+✅ 50-100x: ${x50_100} tokens
+✅ >100x: ${x100plus} tokens
+❌ loss: ${losses} tokens
+
+🔴 *Win Rate:* ${winRate}%
+📈 *Total ROI:* ${totalROI.toFixed(2)}%
+🔑 *Average Gains:* ${avgGains}%
+
+📡 *Currently Tracking:* ${trackedTokens.size} tokens
     `, {
         parse_mode: 'Markdown',
         reply_markup: {
             inline_keyboard: [
+                [{ text: '🔄 Refresh', callback_data: 'menu_stats' }],
                 [{ text: '⬅️ Back to Menu', callback_data: 'menu_back' }]
             ]
         }
