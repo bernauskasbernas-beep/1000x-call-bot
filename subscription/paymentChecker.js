@@ -1,5 +1,12 @@
 const axios = require('axios');
+const path = require('path');
 const subscriptionManager = require('./subscriptionManager');
+
+// Load .env from project root
+require('dotenv').config({ path: path.join(__dirname, '../.env') });
+
+// Admin Telegram ID for notifications
+const ADMIN_ID = process.env.ADMIN_ID;
 
 // Helius API key (same as used in the bot)
 const HELIUS_API_KEY = '5c70b747-7e24-415b-8b87-697caaad0360';
@@ -270,6 +277,28 @@ Thank you for subscribing! 🚀
                 });
 
                 console.log(`[PAYMENT] Sent confirmation to user ${userId}`);
+
+                // Send notification to admin
+                if (ADMIN_ID) {
+                    try {
+                        await this.bot.telegram.sendMessage(ADMIN_ID, `
+💰 *NEW VIP PURCHASE!*
+
+👤 User: ${sub.username || 'Unknown'} (ID: ${userId})
+📦 Plan: ${sub.planName}
+💵 Amount: ${sub.amountPaid.toFixed(6)} SOL
+🔗 TX: \`${transaction.signature}\`
+
+📊 Total active VIPs: ${subscriptionManager.getActiveSubscribers().length}
+                        `, {
+                            parse_mode: 'Markdown',
+                            disable_web_page_preview: true
+                        });
+                        console.log(`[PAYMENT] Sent admin notification`);
+                    } catch (adminErr) {
+                        console.error('[PAYMENT] Error sending admin notification:', adminErr.message);
+                    }
+                }
 
             } catch (e) {
                 console.error('[PAYMENT] Error sending confirmation:', e.message);
