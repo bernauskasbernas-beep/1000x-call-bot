@@ -40,17 +40,43 @@ function formatCallMessage(token, safety) {
     if (token.rugScore !== null) {
         message += `\n\n🛡️ <b>RugCheck:</b> ${getRugEmoji(token.rugScore)} ${token.rugScore}/1000`;
 
-        // Top holders concentration
-        if (token.topHolders?.top10Pct) {
-            const holdPct = (token.topHolders.top10Pct * 100).toFixed(1);
-            message += ` | Top10: ${holdPct}%`;
-        }
-
         // Show top risks (max 2)
         if (token.rugRisks && token.rugRisks.length > 0) {
             const topRisks = token.rugRisks.slice(0, 2).map(r => escapeHtml(r.name)).join(', ');
             message += `\n⚠️ ${topRisks}`;
         }
+    }
+
+    // Detailed Top 10 Holders
+    if (token.topHolders?.holders && token.topHolders.holders.length > 0) {
+        message += `\n\n👥 <b>Top 10 Holders:</b>`;
+
+        // Dev holding (if found)
+        if (token.topHolders.devPct > 0) {
+            message += `\n🔧 <b>Dev:</b> ${(token.topHolders.devPct * 100).toFixed(2)}%`;
+        }
+
+        // Individual holders (compact format: 2 per line)
+        const holders = token.topHolders.holders;
+        for (let i = 0; i < holders.length; i += 2) {
+            const h1 = holders[i];
+            const h2 = holders[i + 1];
+
+            const h1Label = h1.isCreator ? `🔧${h1.rank}` : `#${h1.rank}`;
+            const h1Pct = (h1.pct * 100).toFixed(2);
+
+            if (h2) {
+                const h2Label = h2.isCreator ? `🔧${h2.rank}` : `#${h2.rank}`;
+                const h2Pct = (h2.pct * 100).toFixed(2);
+                message += `\n${h1Label}: ${h1Pct}% | ${h2Label}: ${h2Pct}%`;
+            } else {
+                message += `\n${h1Label}: ${h1Pct}%`;
+            }
+        }
+
+        // Total concentration
+        const totalPct = (token.topHolders.top10Pct * 100).toFixed(1);
+        message += `\n📊 <b>Total:</b> ${totalPct}%`;
     }
 
     // Add socials if available
@@ -67,11 +93,12 @@ function formatCallMessage(token, safety) {
 
 <a href="https://dexscreener.com/solana/${token.address}">Dex</a> | <a href="https://birdeye.so/token/${token.address}?chain=solana">Birdeye</a> | <a href="https://photon-sol.tinyastro.io/en/lp/${token.address}">Photon</a> | <a href="https://pump.fun/${token.address}">Pump</a> | <a href="https://rugcheck.xyz/tokens/${token.address}">RugCheck</a>
 
-💎 Join VIP for premium signals without delay.
-🎁 FREE group has no delay until end of January!
+━━━━━━━━━━━━━━━━━━━━━
+⏱ FREE group = 2 min delay
+💎 VIP = Instant premium signals
 ⚠️ Always DYOR!
 
-👉 @Degens_1000x_call_bot`;
+🚀 Join VIP → @Degens_1000x_call_bot`;
 
     return message;
 }

@@ -111,16 +111,17 @@ class PumpFunTracker extends EventEmitter {
         console.log(`   🔄 Fetching data from Solana Vibe Station + DexScreener...`);
 
         // ============ 1. SOLANA VIBE STATION API (Primary - faster indexing) ============
+        const SVS_API_KEY = 'c48991a229b6d58fba136c9cc9af62cf';
         let svsSuccess = false;
         try {
             const [metaRes, priceRes] = await Promise.all([
-                axios.post('https://beta-api.solanavibestation.com/metadata',
+                axios.post('https://free.api.solanavibestation.com/metadata',
                     { mints: [mintAddress] },
-                    { timeout: 10000, headers: { 'Content-Type': 'application/json' } }
+                    { timeout: 10000, headers: { 'Content-Type': 'application/json', 'Authorization': SVS_API_KEY } }
                 ),
-                axios.post('https://beta-api.solanavibestation.com/price',
+                axios.post('https://free.api.solanavibestation.com/price',
                     { mints: [mintAddress] },
-                    { timeout: 10000, headers: { 'Content-Type': 'application/json' } }
+                    { timeout: 10000, headers: { 'Content-Type': 'application/json', 'Authorization': SVS_API_KEY } }
                 )
             ]);
 
@@ -224,7 +225,65 @@ class PumpFunTracker extends EventEmitter {
             console.log(`   ⚠️ DexScreener fetch failed: ${e.message}`);
         }
 
-        // ============ 3. HELIUS DAS API (Reliable fallback for metadata) ============
+        // ============ 3. GECKOTERMINAL (Additional price data - price changes, txs) ============
+        try {
+            const geckoRes = await axios.get(
+                `https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mintAddress}`,
+                { timeout: 10000 }
+            );
+
+            if (geckoRes.data?.data?.attributes) {
+                const attr = geckoRes.data.data.attributes;
+
+                // Price if not set
+                if (!initialToken.price && attr.price_usd) {
+                    initialToken.price = parseFloat(attr.price_usd);
+                }
+
+                // FDV/MC if not set
+                if (!initialToken.marketCap && attr.fdv_usd) {
+                    initialToken.marketCap = parseFloat(attr.fdv_usd);
+                }
+
+                // Volume if not set
+                if (!initialToken.volume24h && attr.volume_usd?.h24) {
+                    initialToken.volume24h = parseFloat(attr.volume_usd.h24);
+                }
+
+                console.log(`   ✅ GeckoTerminal: Price=$${attr.price_usd ? parseFloat(attr.price_usd).toFixed(8) : 'N/A'}`);
+            }
+
+            // Also try to get pool data for price changes
+            const poolsRes = await axios.get(
+                `https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mintAddress}/pools?page=1`,
+                { timeout: 10000 }
+            );
+
+            if (poolsRes.data?.data?.[0]?.attributes) {
+                const poolAttr = poolsRes.data.data[0].attributes;
+
+                // Price change percentages
+                if (poolAttr.price_change_percentage) {
+                    initialToken.priceChange5m = parseFloat(poolAttr.price_change_percentage.m5) || 0;
+                    initialToken.priceChange15m = parseFloat(poolAttr.price_change_percentage.m15) || 0;
+                    initialToken.priceChange1h = parseFloat(poolAttr.price_change_percentage.h1) || 0;
+                    initialToken.priceChange24h = parseFloat(poolAttr.price_change_percentage.h24) || 0;
+                }
+
+                // Transaction counts
+                if (poolAttr.transactions?.h1) {
+                    initialToken.buys1h = poolAttr.transactions.h1.buys || 0;
+                    initialToken.sells1h = poolAttr.transactions.h1.sells || 0;
+                    initialToken.buyRatio = initialToken.buys1h / (initialToken.buys1h + initialToken.sells1h || 1);
+                }
+
+                console.log(`   ✅ GeckoTerminal Pool: 1h Change=${initialToken.priceChange1h?.toFixed(1) || 0}% | Buys=${initialToken.buys1h || 0} Sells=${initialToken.sells1h || 0}`);
+            }
+        } catch (e) {
+            console.log(`   ⚠️ GeckoTerminal failed: ${e.message}`);
+        }
+
+        // ============ 4. HELIUS DAS API (Reliable fallback for metadata) ============
         if (!initialToken.image) {
             try {
                 console.log(`   🔗 Trying Helius DAS API for metadata...`);
@@ -268,7 +327,7 @@ class PumpFunTracker extends EventEmitter {
             }
         }
 
-        // ============ 4. SOLANA RPC (Last resort fallback) ============
+        // ============ 5. SOLANA RPC (Last resort fallback) ============
         if (!initialToken.image) {
             try {
                 console.log(`   🔗 Trying Solana RPC for on-chain metadata...`);
@@ -322,7 +381,7 @@ class PumpFunTracker extends EventEmitter {
             }
         }
 
-        // ============ 4. RUGCHECK (Safety score) ============
+        // ============ 6. RUGCHECK (Safety score) ============
         try {
             const rug = await axios.get(
                 `https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report/summary`,
@@ -339,9 +398,19 @@ class PumpFunTracker extends EventEmitter {
                     }));
                 }
                 if (rug.data.topHolders) {
+                    const top10 = rug.data.topHolders.slice(0, 10);
                     initialToken.topHolders = {
-                        top10Pct: rug.data.topHolders.slice(0, 10).reduce((sum, h) => sum + (h.pct || 0), 0),
-                        count: rug.data.topHolders.length
+                        top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0),
+                        count: rug.data.topHolders.length,
+                        // Individual holder data for detailed display
+                        holders: top10.map((h, i) => ({
+                            rank: i + 1,
+                            pct: h.pct || 0,
+                            address: h.address ? `${h.address.slice(0, 4)}...${h.address.slice(-4)}` : '????',
+                            isCreator: h.isCreator || false
+                        })),
+                        // Dev holding (creator)
+                        devPct: rug.data.topHolders.find(h => h.isCreator)?.pct || 0
                     };
                 }
                 console.log(`   🛡️ RugCheck: ${rug.data.score}/1000`);
@@ -588,9 +657,19 @@ class PumpFunTracker extends EventEmitter {
             }
 
             if (rug.topHolders) {
+                const top10 = rug.topHolders.slice(0, 10);
                 tokenData.topHolders = {
-                    top10Pct: rug.topHolders.slice(0, 10).reduce((sum, h) => sum + (h.pct || 0), 0),
-                    count: rug.topHolders.length
+                    top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0),
+                    count: rug.topHolders.length,
+                    // Individual holder data for detailed display
+                    holders: top10.map((h, i) => ({
+                        rank: i + 1,
+                        pct: h.pct || 0,
+                        address: h.address ? `${h.address.slice(0, 4)}...${h.address.slice(-4)}` : '????',
+                        isCreator: h.isCreator || false
+                    })),
+                    // Dev holding (creator)
+                    devPct: rug.topHolders.find(h => h.isCreator)?.pct || 0
                 };
             }
             console.log(`   🛡️ RugCheck: ${rug.score} | Risks: ${tokenData.rugRisks.length}`);
