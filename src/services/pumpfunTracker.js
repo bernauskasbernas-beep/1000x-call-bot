@@ -381,11 +381,12 @@ class PumpFunTracker extends EventEmitter {
             }
         }
 
-        // ============ 6. RUGCHECK (Safety score) ============
+        // ============ 6. RUGCHECK (Safety score + Holders) ============
         try {
+            // Use full /report endpoint (not /summary) to get topHolders data
             const rug = await axios.get(
-                `https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report/summary`,
-                { timeout: 10000 }
+                `https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report`,
+                { timeout: 15000 }
             );
             if (rug.data) {
                 initialToken.rugScore = rug.data.score;
@@ -397,26 +398,35 @@ class PumpFunTracker extends EventEmitter {
                         description: r.description
                     }));
                 }
-                if (rug.data.topHolders) {
+                // Full report has topHolders with pct in percentage format (e.g., 81.71 = 81.71%)
+                if (rug.data.topHolders && rug.data.topHolders.length > 0) {
+                    const creator = rug.data.creator; // Dev wallet address
                     const top10 = rug.data.topHolders.slice(0, 10);
+
+                    // Find dev holding by matching owner to creator
+                    const devHolder = top10.find(h => h.owner === creator);
+
                     initialToken.topHolders = {
-                        top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0),
+                        // pct is already in percentage format (81.71 = 81.71%), divide by 100 for consistency
+                        top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0) / 100,
                         count: rug.data.topHolders.length,
                         // Individual holder data for detailed display
                         holders: top10.map((h, i) => ({
                             rank: i + 1,
-                            pct: h.pct || 0,
+                            pct: (h.pct || 0) / 100, // Convert to decimal (0.8171)
                             address: h.address ? `${h.address.slice(0, 4)}...${h.address.slice(-4)}` : '????',
-                            isCreator: h.isCreator || false
+                            isCreator: h.owner === creator
                         })),
-                        // Dev holding (creator)
-                        devPct: rug.data.topHolders.find(h => h.isCreator)?.pct || 0
+                        // Dev holding
+                        devPct: devHolder ? (devHolder.pct / 100) : 0
                     };
+                    console.log(`   🛡️ RugCheck: ${rug.data.score}/1000 | Top10: ${(initialToken.topHolders.top10Pct * 100).toFixed(1)}%`);
+                } else {
+                    console.log(`   🛡️ RugCheck: ${rug.data.score}/1000 | No holders data`);
                 }
-                console.log(`   🛡️ RugCheck: ${rug.data.score}/1000`);
             }
         } catch (e) {
-            // RugCheck optional
+            console.log(`   ⚠️ RugCheck failed: ${e.message}`);
         }
 
         // Final summary
@@ -562,7 +572,7 @@ class PumpFunTracker extends EventEmitter {
         const [pumpResult, dexResult, rugResult, jupiterResult] = await Promise.allSettled([
             axios.get(`https://frontend-api.pump.fun/coins/${mintAddress}`, { timeout: 15000 }),
             axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mintAddress}`, { timeout: 15000 }),
-            axios.get(`https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report/summary`, { timeout: 15000 }),
+            axios.get(`https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report`, { timeout: 15000 }), // Full report for topHolders
             axios.get(`https://tokens.jup.ag/token/${mintAddress}`, { timeout: 15000 })
         ]);
 
@@ -642,7 +652,7 @@ class PumpFunTracker extends EventEmitter {
             console.log(`   ⚠️ Jupiter - Not listed yet`);
         }
 
-        // ============ 4. RUGCHECK - Safety score ============
+        // ============ 4. RUGCHECK - Safety score + Holders ============
         if (rugResult.status === 'fulfilled' && rugResult.value?.data) {
             const rug = rugResult.value.data;
             tokenData.rugScore = rug.score;
@@ -656,23 +666,32 @@ class PumpFunTracker extends EventEmitter {
                 }));
             }
 
-            if (rug.topHolders) {
+            // Full report has topHolders with pct in percentage format (e.g., 81.71 = 81.71%)
+            if (rug.topHolders && rug.topHolders.length > 0) {
+                const creator = rug.creator; // Dev wallet address
                 const top10 = rug.topHolders.slice(0, 10);
+
+                // Find dev holding by matching owner to creator
+                const devHolder = top10.find(h => h.owner === creator);
+
                 tokenData.topHolders = {
-                    top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0),
+                    // pct is already in percentage format, divide by 100 for consistency
+                    top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0) / 100,
                     count: rug.topHolders.length,
                     // Individual holder data for detailed display
                     holders: top10.map((h, i) => ({
                         rank: i + 1,
-                        pct: h.pct || 0,
+                        pct: (h.pct || 0) / 100, // Convert to decimal
                         address: h.address ? `${h.address.slice(0, 4)}...${h.address.slice(-4)}` : '????',
-                        isCreator: h.isCreator || false
+                        isCreator: h.owner === creator
                     })),
-                    // Dev holding (creator)
-                    devPct: rug.topHolders.find(h => h.isCreator)?.pct || 0
+                    // Dev holding
+                    devPct: devHolder ? (devHolder.pct / 100) : 0
                 };
+                console.log(`   🛡️ RugCheck: ${rug.score} | Top10: ${(tokenData.topHolders.top10Pct * 100).toFixed(1)}%`);
+            } else {
+                console.log(`   🛡️ RugCheck: ${rug.score} | No holders data`);
             }
-            console.log(`   🛡️ RugCheck: ${rug.score} | Risks: ${tokenData.rugRisks.length}`);
         } else {
             console.log(`   ⚠️ RugCheck - Failed`);
         }
