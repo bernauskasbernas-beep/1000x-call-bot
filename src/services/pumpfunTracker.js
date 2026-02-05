@@ -11,6 +11,7 @@ class PumpFunTracker extends EventEmitter {
         this.reconnectAttempts = 0;
         this.maxReconnectAttempts = 3; // Quick fallback to polling
         this.pollInterval = null;
+        this.skipWebSocket = false; // Set to true when StreamFW is primary
     }
 
     async startTracking() {
@@ -19,16 +20,20 @@ class PumpFunTracker extends EventEmitter {
 
         console.log('🔍 Starting tracker...');
 
-        // Try WebSocket first
-        this.connectWebSocket();
+        if (!this.skipWebSocket) {
+            // Try WebSocket first
+            this.connectWebSocket();
 
-        // Start polling as backup after 5 seconds if WebSocket fails
-        setTimeout(() => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                console.log('📡 WebSocket not connected, using DexScreener polling...');
-                this.startPolling();
-            }
-        }, 5000);
+            // Start polling as backup after 5 seconds if WebSocket fails
+            setTimeout(() => {
+                if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+                    console.log('📡 WebSocket not connected, using DexScreener polling...');
+                    this.startPolling();
+                }
+            }, 5000);
+        } else {
+            console.log('📡 PumpPortal WebSocket skipped (StreamFW is primary)');
+        }
     }
 
     connectWebSocket() {
@@ -103,10 +108,10 @@ class PumpFunTracker extends EventEmitter {
 
     // DELAYED EMIT: Wait for APIs to index, then fetch full data and emit
     async emitWithDelay(mintAddress, initialToken) {
-        console.log(`   ⏳ Waiting 30s for APIs to index token...`);
+        console.log(`   ⏳ Waiting 20s for APIs to index token...`);
 
-        // Wait 30 seconds (SVS is faster than DexScreener)
-        await new Promise(r => setTimeout(r, 30000));
+        // Wait 20 seconds for APIs to index (SVS ~5s, DexScreener ~15-25s, RugCheck ~10-20s)
+        await new Promise(r => setTimeout(r, 20000));
 
         console.log(`   🔄 Fetching data from Solana Vibe Station + DexScreener...`);
 
@@ -381,52 +386,97 @@ class PumpFunTracker extends EventEmitter {
             }
         }
 
-        // ============ 6. RUGCHECK (Safety score + Holders) ============
+        // ============ 6. RUGCHECK + BUNDLE DETECTION (parallel) ============
+        const [rugResult, bundleResult] = await Promise.allSettled([
+            axios.get(`https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report`, { timeout: 15000 }),
+            this.detectBundleAndSnipers(mintAddress)
+        ]);
+
+        // Process RugCheck result
         try {
-            // Use full /report endpoint (not /summary) to get topHolders data
-            const rug = await axios.get(
-                `https://api.rugcheck.xyz/v1/tokens/${mintAddress}/report`,
-                { timeout: 15000 }
-            );
-            if (rug.data) {
-                initialToken.rugScore = rug.data.score;
-                initialToken.isRugSafe = rug.data.score >= 500;
-                if (rug.data.risks && Array.isArray(rug.data.risks)) {
-                    initialToken.rugRisks = rug.data.risks.slice(0, 5).map(r => ({
+            if (rugResult.status === 'fulfilled' && rugResult.value?.data) {
+                const rugData = rugResult.value.data;
+                initialToken.rugScore = rugData.score;
+                initialToken.isRugSafe = rugData.score >= 500;
+                if (rugData.risks && Array.isArray(rugData.risks)) {
+                    initialToken.rugRisks = rugData.risks.slice(0, 5).map(r => ({
                         name: r.name,
                         level: r.level,
                         description: r.description
                     }));
                 }
                 // Full report has topHolders with pct in percentage format (e.g., 81.71 = 81.71%)
-                if (rug.data.topHolders && rug.data.topHolders.length > 0) {
-                    const creator = rug.data.creator; // Dev wallet address
-                    const top10 = rug.data.topHolders.slice(0, 10);
+                if (rugData.topHolders && rugData.topHolders.length > 0) {
+                    const creator = rugData.creator; // Dev wallet address
+                    const poolAddress = initialToken.pairAddress || null;
+                    const top10 = rugData.topHolders.slice(0, 10);
+
+                    // Known non-holder addresses (LP pools, bonding curves, programs)
+                    const KNOWN_CONTRACTS = [
+                        '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1', // Pump.fun bonding curve
+                        'TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM',  // PumpSwap AMM
+                        '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8', // Raydium AMM v4
+                        '5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h', // Raydium authority
+                        'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C', // Raydium CPMM
+                    ];
 
                     // Find dev holding by matching owner to creator
                     const devHolder = top10.find(h => h.owner === creator);
 
-                    initialToken.topHolders = {
-                        // pct is already in percentage format (81.71 = 81.71%), divide by 100 for consistency
-                        top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0) / 100,
-                        count: rug.data.topHolders.length,
-                        // Individual holder data for detailed display
-                        holders: top10.map((h, i) => ({
+                    // Identify each holder type
+                    const holdersWithType = top10.map((h, i) => {
+                        const owner = h.owner || '';
+                        const isPool = KNOWN_CONTRACTS.some(c => owner.includes(c)) ||
+                                       (poolAddress && owner === poolAddress);
+                        const isCreator = owner === creator;
+
+                        return {
                             rank: i + 1,
-                            pct: (h.pct || 0) / 100, // Convert to decimal (0.8171)
+                            pct: (h.pct || 0) / 100,
                             address: h.address ? `${h.address.slice(0, 4)}...${h.address.slice(-4)}` : '????',
-                            isCreator: h.owner === creator
-                        })),
-                        // Dev holding
-                        devPct: devHolder ? (devHolder.pct / 100) : 0
+                            isCreator,
+                            isPool
+                        };
+                    });
+
+                    // Calculate top10 % EXCLUDING pools/contracts (real holders only)
+                    const realHolders = holdersWithType.filter(h => !h.isPool);
+                    const realTop10Pct = realHolders.reduce((sum, h) => sum + h.pct, 0);
+                    const allTop10Pct = holdersWithType.reduce((sum, h) => sum + h.pct, 0);
+
+                    initialToken.topHolders = {
+                        top10Pct: realTop10Pct, // Only real holders for filtering
+                        top10PctAll: allTop10Pct, // Including pools for display
+                        count: rugData.topHolders.length,
+                        holders: holdersWithType,
+                        devPct: devHolder ? (devHolder.pct / 100) : 0,
+                        devSold: rugData.creatorBalance === 0
                     };
-                    console.log(`   🛡️ RugCheck: ${rug.data.score}/1000 | Top10: ${(initialToken.topHolders.top10Pct * 100).toFixed(1)}%`);
+                    console.log(`   🛡️ RugCheck: ${rugData.score}/1000 | Top10: ${(realTop10Pct * 100).toFixed(1)}% real (${(allTop10Pct * 100).toFixed(1)}% with pools)`);
                 } else {
-                    console.log(`   🛡️ RugCheck: ${rug.data.score}/1000 | No holders data`);
+                    console.log(`   🛡️ RugCheck: ${rugData.score}/1000 | No holders data`);
                 }
+            } else if (rugResult.status === 'rejected') {
+                console.log(`   ⚠️ RugCheck failed: ${rugResult.reason?.message || 'Unknown error'}`);
             }
         } catch (e) {
-            console.log(`   ⚠️ RugCheck failed: ${e.message}`);
+            console.log(`   ⚠️ RugCheck processing error: ${e.message}`);
+        }
+
+        // Process Bundle/Sniper result
+        if (bundleResult.status === 'fulfilled') {
+            const bd = bundleResult.value;
+            initialToken.bundleCount = bd.bundleCount;
+            initialToken.sniperCount = bd.sniperCount;
+            initialToken.bundleHoldPct = bd.bundleHoldPct;
+            initialToken.sniperHoldPct = bd.sniperHoldPct;
+            console.log(`   🔍 Bundle: ${bd.bundleCount} (${bd.bundleHoldPct}%) | Snipers: ${bd.sniperCount} (${bd.sniperHoldPct}%)`);
+        } else {
+            initialToken.bundleCount = 0;
+            initialToken.sniperCount = 0;
+            initialToken.bundleHoldPct = 0;
+            initialToken.sniperHoldPct = 0;
+            console.log(`   ⚠️ Bundle detection failed`);
         }
 
         // Final summary
@@ -563,7 +613,11 @@ class PumpFunTracker extends EventEmitter {
             rugScore: null,
             rugRisks: [],
             topHolders: null,
-            isRugSafe: null
+            isRugSafe: null,
+            bundleCount: 0,
+            sniperCount: 0,
+            bundleHoldPct: 0,
+            sniperHoldPct: 0
         };
 
         console.log(`   🔄 Fetching from Pump.fun + DexScreener + RugCheck + Jupiter...`);
@@ -668,27 +722,42 @@ class PumpFunTracker extends EventEmitter {
 
             // Full report has topHolders with pct in percentage format (e.g., 81.71 = 81.71%)
             if (rug.topHolders && rug.topHolders.length > 0) {
-                const creator = rug.creator; // Dev wallet address
+                const creator = rug.creator;
                 const top10 = rug.topHolders.slice(0, 10);
 
-                // Find dev holding by matching owner to creator
+                const KNOWN_CONTRACTS = [
+                    '5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1',
+                    'TSLvdd1pWpHVjahSpsvCXUbgwsL3JAcvokwaKt1eokM',
+                    '675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8',
+                    '5quBtoiQqxF9Jv6KYKctB59NT3gtJD2Y65kdnB1Uev3h',
+                    'CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C',
+                ];
+
                 const devHolder = top10.find(h => h.owner === creator);
 
-                tokenData.topHolders = {
-                    // pct is already in percentage format, divide by 100 for consistency
-                    top10Pct: top10.reduce((sum, h) => sum + (h.pct || 0), 0) / 100,
-                    count: rug.topHolders.length,
-                    // Individual holder data for detailed display
-                    holders: top10.map((h, i) => ({
+                const holdersWithType = top10.map((h, i) => {
+                    const owner = h.owner || '';
+                    const isPool = KNOWN_CONTRACTS.some(c => owner.includes(c));
+                    return {
                         rank: i + 1,
-                        pct: (h.pct || 0) / 100, // Convert to decimal
+                        pct: (h.pct || 0) / 100,
                         address: h.address ? `${h.address.slice(0, 4)}...${h.address.slice(-4)}` : '????',
-                        isCreator: h.owner === creator
-                    })),
-                    // Dev holding
+                        isCreator: h.owner === creator,
+                        isPool
+                    };
+                });
+
+                const realHolders = holdersWithType.filter(h => !h.isPool);
+                const realTop10Pct = realHolders.reduce((sum, h) => sum + h.pct, 0);
+
+                tokenData.topHolders = {
+                    top10Pct: realTop10Pct,
+                    top10PctAll: holdersWithType.reduce((sum, h) => sum + h.pct, 0),
+                    count: rug.topHolders.length,
+                    holders: holdersWithType,
                     devPct: devHolder ? (devHolder.pct / 100) : 0
                 };
-                console.log(`   🛡️ RugCheck: ${rug.score} | Top10: ${(tokenData.topHolders.top10Pct * 100).toFixed(1)}%`);
+                console.log(`   🛡️ RugCheck: ${rug.score} | Top10: ${(realTop10Pct * 100).toFixed(1)}% real`);
             } else {
                 console.log(`   🛡️ RugCheck: ${rug.score} | No holders data`);
             }
@@ -809,7 +878,12 @@ class PumpFunTracker extends EventEmitter {
             rugScore: null,
             rugRisks: [],
             topHolders: null,
-            isRugSafe: null
+            isRugSafe: null,
+            // Bundle/Sniper data
+            bundleCount: 0,
+            sniperCount: 0,
+            bundleHoldPct: 0,
+            sniperHoldPct: 0
         };
     }
 
@@ -848,15 +922,18 @@ class PumpFunTracker extends EventEmitter {
 
     checkFilters(token, filters = {}) {
         // ========== CALL FILTERS ==========
-        // 1. LP ≥ 15 SOL (~$3,000 USD)
-        // 2. Top 10 holders ≤ 40%
+        // 1. LP ≥ $3,000 USD
+        // 2. Top 10 holders ≤ 35%
         // 3. Mint authority revoked
         // 4. Freeze authority revoked
-        // 5. Volume > $5,000 (5min)
+        // 5. Volume ≥ $7,500 (5min)
+        // 6. Market Cap ≥ $20,000
+        // 7. Bundle wallets hold ≤ 20% supply
+        // 8. Sniper wallets hold ≤ 20% supply
 
         const MIN_LIQUIDITY_USD = 3000;  // ~15 SOL
-        const MAX_TOP10_PERCENT = 40;
-        const MIN_VOLUME_5M = 5000;
+        const MAX_TOP10_PERCENT = 35;
+        const MIN_VOLUME_5M = 7500;
 
         const checks = {};
         const reasons = [];
@@ -868,30 +945,47 @@ class PumpFunTracker extends EventEmitter {
         }
 
         // 2. Top 10 holders ≤ 40%
-        const top10Pct = token.topHolders?.top10Pct || 0;
-        checks.topHolders = top10Pct <= MAX_TOP10_PERCENT || top10Pct === 0; // 0 = no data, pass
+        const top10PctRaw = token.topHolders?.top10Pct || 0;
+        // top10Pct is stored as decimal (0.82 = 82%), convert to percentage for comparison
+        const top10Pct = top10PctRaw > 1 ? top10PctRaw : top10PctRaw * 100;
+        checks.topHolders = top10Pct <= MAX_TOP10_PERCENT || top10PctRaw === 0; // 0 = no data, pass
         if (!checks.topHolders) {
             reasons.push(`Top10 ${top10Pct.toFixed(1)}% > ${MAX_TOP10_PERCENT}%`);
         }
 
-        // 3. Mint authority revoked
-        const hasMintRisk = token.rugRisks?.some(r =>
-            r.name?.toLowerCase().includes('mint') &&
-            !r.name?.toLowerCase().includes('revoked')
-        );
-        checks.mintRevoked = !hasMintRisk;
-        if (!checks.mintRevoked) {
-            reasons.push('Mint NOT revoked');
+        // 3. RugCheck data must be available
+        const hasRugData = token.rugRisks && token.rugRisks.length > 0;
+        checks.rugDataAvailable = hasRugData || (token.rugScore !== null && token.rugScore !== undefined);
+        if (!checks.rugDataAvailable) {
+            reasons.push('No RugCheck data');
         }
 
-        // 4. Freeze authority revoked
-        const hasFreezeRisk = token.rugRisks?.some(r =>
-            r.name?.toLowerCase().includes('freeze') &&
-            !r.name?.toLowerCase().includes('revoked')
-        );
-        checks.freezeRevoked = !hasFreezeRisk;
-        if (!checks.freezeRevoked) {
-            reasons.push('Freeze NOT revoked');
+        // 4. Mint authority revoked (only check if RugCheck data exists)
+        if (hasRugData) {
+            const hasMintRisk = token.rugRisks.some(r =>
+                r.name?.toLowerCase().includes('mint') &&
+                !r.name?.toLowerCase().includes('revoked')
+            );
+            checks.mintRevoked = !hasMintRisk;
+            if (!checks.mintRevoked) {
+                reasons.push('Mint NOT revoked');
+            }
+        } else {
+            checks.mintRevoked = false; // No data = fail
+        }
+
+        // 5. Freeze authority revoked (only check if RugCheck data exists)
+        if (hasRugData) {
+            const hasFreezeRisk = token.rugRisks.some(r =>
+                r.name?.toLowerCase().includes('freeze') &&
+                !r.name?.toLowerCase().includes('revoked')
+            );
+            checks.freezeRevoked = !hasFreezeRisk;
+            if (!checks.freezeRevoked) {
+                reasons.push('Freeze NOT revoked');
+            }
+        } else {
+            checks.freezeRevoked = false; // No data = fail
         }
 
         // 5. Volume > $5,000 (5min)
@@ -901,13 +995,36 @@ class PumpFunTracker extends EventEmitter {
             reasons.push(`Vol $${Math.round(volume5m)} < $${MIN_VOLUME_5M}`);
         }
 
+        // 6. Minimum Market Cap ≥ $20,000
+        const MIN_MC = 20000;
+        checks.marketCap = (token.marketCap || 0) >= MIN_MC;
+        if (!checks.marketCap) {
+            reasons.push(`MC $${Math.round(token.marketCap || 0)} < $${MIN_MC}`);
+        }
+
+        // 7. Bundle wallets hold ≤ 20% supply
+        const MAX_BUNDLE_HOLD_PCT = 20;
+        const bundleHoldPct = token.bundleHoldPct || 0;
+        checks.bundleHold = bundleHoldPct <= MAX_BUNDLE_HOLD_PCT;
+        if (!checks.bundleHold) {
+            reasons.push(`Bundle ${bundleHoldPct.toFixed(1)}% > ${MAX_BUNDLE_HOLD_PCT}%`);
+        }
+
+        // 8. Sniper wallets hold ≤ 20% supply
+        const MAX_SNIPER_HOLD_PCT = 20;
+        const sniperHoldPct = token.sniperHoldPct || 0;
+        checks.sniperHold = sniperHoldPct <= MAX_SNIPER_HOLD_PCT;
+        if (!checks.sniperHold) {
+            reasons.push(`Sniper ${sniperHoldPct.toFixed(1)}% > ${MAX_SNIPER_HOLD_PCT}%`);
+        }
+
         // All checks must pass
         const passed = Object.values(checks).every(v => v === true);
 
         if (!passed) {
             console.log(`   ❌ FILTERED: ${reasons.join(' | ')}`);
         } else {
-            console.log(`   ✅ PASSED: LP=$${Math.round(token.liquidity)} | Top10=${top10Pct.toFixed(1)}% | Vol=$${Math.round(volume5m)}`);
+            console.log(`   ✅ PASSED: LP=$${Math.round(token.liquidity)} | Top10=${top10Pct.toFixed(1)}% | MC=$${Math.round(token.marketCap)} | Vol=$${Math.round(volume5m)} | Bundle=${bundleHoldPct.toFixed(1)}% | Sniper=${sniperHoldPct.toFixed(1)}%`);
         }
 
         return { passed, checks, reasons };
@@ -953,6 +1070,78 @@ class PumpFunTracker extends EventEmitter {
             positives,
             risk: score >= 70 ? 'LOW' : score >= 50 ? 'MEDIUM' : 'HIGH'
         };
+    }
+
+    // Detect bundle buys and snipers using Helius Enhanced Transactions API
+    async detectBundleAndSnipers(mintAddress) {
+        try {
+            const HELIUS_KEY = process.env.HELIUS_API_KEY || '5c70b747-7e24-415b-8b87-697caaad0360';
+            const response = await axios.get(
+                `https://api.helius.xyz/v0/addresses/${mintAddress}/transactions?api-key=${HELIUS_KEY}&limit=100`,
+                { timeout: 15000 }
+            );
+            const txs = response.data || [];
+            if (txs.length === 0) return { bundleCount: 0, sniperCount: 0, bundleHoldPct: 0, sniperHoldPct: 0 };
+
+            // Pump.fun tokens have 1 billion total supply
+            const TOTAL_SUPPLY = 1_000_000_000;
+
+            // Sort by slot ascending (oldest first)
+            txs.sort((a, b) => a.slot - b.slot);
+            const creationSlot = txs[0].slot;
+
+            // Collect buyer wallets per slot with their token amounts
+            const buyersBySlot = new Map(); // slot -> Map(wallet -> totalAmount)
+            for (const tx of txs) {
+                if (!tx.tokenTransfers) continue;
+                for (const t of tx.tokenTransfers) {
+                    if (t.mint === mintAddress && t.toUserAccount && t.tokenAmount > 0) {
+                        if (!buyersBySlot.has(tx.slot)) buyersBySlot.set(tx.slot, new Map());
+                        const slotMap = buyersBySlot.get(tx.slot);
+                        const current = slotMap.get(t.toUserAccount) || 0;
+                        slotMap.set(t.toUserAccount, current + t.tokenAmount);
+                    }
+                }
+            }
+
+            // BUNDLE: wallets that bought in the same slot as creation
+            const creationBuyers = buyersBySlot.get(creationSlot) || new Map();
+            const bundleCount = creationBuyers.size;
+            let bundleTotalTokens = 0;
+            for (const amount of creationBuyers.values()) {
+                bundleTotalTokens += amount;
+            }
+            const bundleHoldPct = (bundleTotalTokens / TOTAL_SUPPLY) * 100;
+
+            // SNIPERS: wallets that bought within ~5s (12 slots) after creation, excluding bundle wallets
+            const SNIPE_WINDOW = 12;
+            const sniperWallets = new Map(); // wallet -> totalAmount
+            for (const [slot, walletAmounts] of buyersBySlot) {
+                if (slot > creationSlot && slot <= creationSlot + SNIPE_WINDOW) {
+                    for (const [wallet, amount] of walletAmounts) {
+                        if (!creationBuyers.has(wallet)) {
+                            const current = sniperWallets.get(wallet) || 0;
+                            sniperWallets.set(wallet, current + amount);
+                        }
+                    }
+                }
+            }
+            let sniperTotalTokens = 0;
+            for (const amount of sniperWallets.values()) {
+                sniperTotalTokens += amount;
+            }
+            const sniperHoldPct = (sniperTotalTokens / TOTAL_SUPPLY) * 100;
+
+            return {
+                bundleCount,
+                sniperCount: sniperWallets.size,
+                bundleHoldPct: Math.round(bundleHoldPct * 100) / 100, // Round to 2 decimals
+                sniperHoldPct: Math.round(sniperHoldPct * 100) / 100
+            };
+        } catch (e) {
+            console.log(`   ⚠️ Bundle detection failed: ${e.message}`);
+            return { bundleCount: 0, sniperCount: 0, bundleHoldPct: 0, sniperHoldPct: 0 };
+        }
     }
 }
 

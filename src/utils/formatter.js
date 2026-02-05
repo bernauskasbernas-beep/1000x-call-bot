@@ -47,17 +47,28 @@ function formatCallMessage(token, safety) {
         }
     }
 
+    // Bundle & Sniper info
+    if (token.bundleCount > 0 || token.sniperCount > 0) {
+        const bundleEmoji = token.bundleCount >= 5 ? '⚠️' : '✅';
+        const sniperEmoji = token.sniperCount >= 10 ? '⚠️' : '✅';
+        const bundlePct = token.bundleHoldPct || 0;
+        const sniperPct = token.sniperHoldPct || 0;
+        message += `\n\n🔍 <b>Bundle:</b> ${bundleEmoji} ${token.bundleCount} (${bundlePct}%) | <b>Snipers:</b> ${sniperEmoji} ${token.sniperCount} (${sniperPct}%)`;
+    }
+
     // Detailed Top 10 Holders
     if (token.topHolders?.holders && token.topHolders.holders.length > 0) {
         message += `\n\n👥 <b>Top 10 Holders:</b>`;
 
-        // Dev holding (if found)
+        // Dev holding status
         if (token.topHolders.devPct > 0) {
             message += `\n🔧 <b>Dev:</b> ${(token.topHolders.devPct * 100).toFixed(2)}%`;
+        } else if (token.topHolders.devSold) {
+            message += `\n🔧 <b>Dev:</b> 0% (sold)`;
         }
 
-        // Individual holders (compact format: 2 per line)
-        const holders = token.topHolders.holders;
+        // Individual holders (compact format: 2 per line, skip pools)
+        const holders = token.topHolders.holders.filter(h => !h.isPool);
         for (let i = 0; i < holders.length; i += 2) {
             const h1 = holders[i];
             const h2 = holders[i + 1];
@@ -74,7 +85,7 @@ function formatCallMessage(token, safety) {
             }
         }
 
-        // Total concentration
+        // Total concentration (real holders only, excluding pools)
         const totalPct = (token.topHolders.top10Pct * 100).toFixed(1);
         message += `\n📊 <b>Total:</b> ${totalPct}%`;
     }
@@ -94,7 +105,7 @@ function formatCallMessage(token, safety) {
 <a href="https://dexscreener.com/solana/${token.address}">Dex</a> | <a href="https://birdeye.so/token/${token.address}?chain=solana">Birdeye</a> | <a href="https://photon-sol.tinyastro.io/en/lp/${token.address}">Photon</a> | <a href="https://pump.fun/${token.address}">Pump</a> | <a href="https://rugcheck.xyz/tokens/${token.address}">RugCheck</a>
 
 ━━━━━━━━━━━━━━━━━━━━━
-⏱ FREE group = 2 min delay
+⏱ FREE group = 1 min delay
 💎 VIP = Instant premium signals
 ⚠️ Always DYOR!
 
